@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dzbarsky/rules_itest/tests/svcctl"
+	"github.com/hermeticbuild/rules_itest/tests/svcctl"
 )
 
 type payload struct {

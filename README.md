@@ -10,7 +10,7 @@ With this ruleset, each test can declare the services it depends on. The test wi
 This ruleset also integrates with [ibazel](https://github.com/bazelbuild/bazel-watcher) to support incremental hot-reload during development.
 
 # Usage
-See [docs/itest.md](https://github.com/dzbarsky/rules_itest/blob/master/docs/itest.md) for full documentation.
+See [docs/itest.md](https://github.com/hermeticbuild/rules_itest/blob/master/docs/itest.md) for full documentation.
 
 Per-service reload under ibazel works by injecting a cache-busting input, so it is disabled by default to keep tests cacheable. You can enable it setting the `--@rules_itest//:enable_per_service_reload` flag.
 
@@ -26,6 +26,6 @@ common:enable-reload --@rules_itest//:enable_per_service_reload
 `ibazel run --config enable-reload //path/to:target`
 
 # Examples
-First-party service examples (Go and Node.js binaries): [tests folder](https://github.com/dzbarsky/rules_itest/tree/master/tests).
+First-party service examples (Go and Node.js binaries): [tests folder](https://github.com/hermeticbuild/rules_itest/tree/master/tests).
 
-More third-party examples (MySQL, Redis, DynamoDB): [examples folder](https://github.com/dzbarsky/rules_itest/tree/master/examples).
+More third-party examples (MySQL, Redis, DynamoDB): [examples folder](https://github.com/hermeticbuild/rules_itest/tree/master/examples).

@@ -1,5 +1,5 @@
 {
-  "homepage": "https://github.com/dzbarsky/rules_itest/blob/master/docs/itest.md",
+  "homepage": "https://github.com/hermeticbuild/rules_itest/blob/master/docs/itest.md",
   "maintainers": [
     {
       "name": "David Zbarsky",
@@ -8,7 +8,7 @@
     }
   ],
   "repository": [
-    "github:dzbarsky/rules_itest"
+    "github:hermeticbuild/rules_itest"
   ],
   "versions": [],
   "yanked_versions": {}
