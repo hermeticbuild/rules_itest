@@ -1,12 +1,30 @@
 load("@rules_itest//:itest.bzl", "itest_service", "service_test")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//:must_fail.bzl", "must_fail")
+load(":cleanup_failure_test.bzl", "cleanup_failure_test")
 
 package(default_visibility = ["//visibility:public"])
+
+NOT_WINDOWS = select({
+    "@platforms//os:windows": ["@platforms//:incompatible"],
+    "//conditions:default": [],
+})
 
 sh_binary(
     name = "crash_immediately",
     srcs = ["crash_immediately.sh"],
+)
+
+sh_binary(
+    name = "cleanup_on_sigterm",
+    srcs = ["cleanup_on_sigterm.sh"],
+)
+
+cleanup_failure_test(
+    name = "cleanup_on_startup_failure_test",
+    target_compatible_with = NOT_WINDOWS,
+    test = ":dependent_startup_failure_test",
+    timeout = "short",
 )
 
 itest_service(
@@ -24,5 +42,33 @@ itest_service(
 must_fail(
     name = "service_exits_before_healthy_failure",
     test = "immediate_exit_service_hygiene_test",
+    timeout = "short",
+)
+
+itest_service(
+    name = "cleanup_service",
+    exe = ":cleanup_on_sigterm",
+    shutdown_timeout = "5s",
+    tags = ["manual"],
+)
+
+itest_service(
+    name = "dependent_immediate_exit_service",
+    autoassign_port = True,
+    deps = [":cleanup_service"],
+    env = {
+        "PORT": "$${PORT}",
+    },
+    exe = ":crash_immediately",
+    health_check_interval = "100ms",
+    http_health_check_address = "http://127.0.0.1:$${PORT}/health",
+    tags = ["manual"],
+)
+
+service_test(
+    name = "dependent_startup_failure_test",
+    services = [":dependent_immediate_exit_service"],
+    tags = ["manual"],
+    test = "@rules_itest//:exit0",
     timeout = "short",
 )

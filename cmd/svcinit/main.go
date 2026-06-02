@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -140,6 +141,13 @@ func main() {
 	r, err := runner.New(ctx, serviceSpecs)
 	must(err)
 
+	mustStopAllForExit := sync.OnceValue(func() map[string]*os.ProcessState {
+		states, err := r.StopAll()
+		cancelFunc()
+		must(err)
+		return states
+	})
+
 	servicesErrCh := make(chan error, len(unversionedSpecs))
 
 	go func() {
@@ -167,10 +175,11 @@ func main() {
 	}()
 
 	criticalPath, err := r.StartAll(servicesErrCh)
-	if errors.Is(err, context.Canceled) {
-		_, err := r.StopAll()
-		must(err)
-		return
+	if err != nil {
+		mustStopAllForExit()
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 	}
 	must(err)
 
@@ -261,8 +270,7 @@ func main() {
 		select {
 		case <-ctx.Done():
 			log.Println("Shutting down services.")
-			_, err := r.StopAll()
-			must(err)
+			mustStopAllForExit()
 			log.Println("Cleaning up.")
 			return
 		case ibazelCmd := <-interactiveCh:
@@ -302,20 +310,21 @@ func main() {
 			if testErr != nil {
 				log.Printf("Encountered error during test run: %s\n", testErr)
 				if isOneShot {
+					mustStopAllForExit()
 					os.Exit(1)
 				}
 			}
 		case serviceErr := <-servicesErrCh:
 			log.Print(serviceErr)
 			if isOneShot {
+				mustStopAllForExit()
 				log.Fatal("Service exited uncleanly, marking test as failed.\n\n")
 			}
 		}
 
 		if isOneShot {
 			buf.WriteString("Target\tUser Time\tSystem Time\n")
-			states, err := r.StopAll()
-			must(err)
+			states := mustStopAllForExit()
 			for label, state := range states {
 				buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
 					label, state.UserTime(), state.SystemTime()))
@@ -637,4 +646,3 @@ func buildTestEnv(ports svclib.Ports) ([]string, error) {
 
 	return baseEnv, nil
 }
-
