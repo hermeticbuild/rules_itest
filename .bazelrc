@@ -10,6 +10,7 @@ common --noexperimental_check_output_files
 common --nolegacy_external_runfiles
 
 common --incompatible_autoload_externally=
+common --@rules_go//go/config:pure
 common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
 common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
 
@@ -17,4 +18,3 @@ common:enable-reload --@rules_itest//:enable_per_service_reload
 
 # TODO: Remove once transitives are fixed
 common --incompatible_autoload_externally=+@rules_cc
-
