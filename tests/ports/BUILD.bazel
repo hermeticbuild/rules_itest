@@ -1,0 +1,148 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@rules_go//go:def.bzl", "go_test")
+load(
+    "@rules_itest//:itest.bzl",
+    "itest_external_service",
+    "itest_port",
+    "itest_service",
+    "itest_service_group",
+    "port_ref",
+    "service_test",
+)
+load(":tests.bzl", "tests")
+
+package(default_visibility = ["//visibility:public"])
+
+NOT_WINDOWS = select({
+    "@platforms//os:windows": ["@platforms//:incompatible"],
+    "//conditions:default": [],
+})
+
+tests()
+
+# An internal service binds a first-class itest_port. The port is referenced by its
+# target label everywhere.
+itest_port(name = "db_port")
+
+itest_service(
+    name = "db",
+    args = [
+        "-port",
+        port_ref(":db_port"),
+    ],
+    exe = "//go_service",
+    http_health_check_address = "http://127.0.0.1:" + port_ref(":db_port"),
+    ports = {":db_port": "sql"},
+)
+
+# An external service points at a fixed FQDN and exposes a port at a literal number.
+itest_port(name = "ext_db_port")
+
+itest_external_service(
+    name = "external_db",
+    domain = "db.test.invalid",
+    port_numbers = {"sql": "5432"},
+    ports = {":ext_db_port": "sql"},
+)
+
+# SO_REUSEPORT awareness must be allowed with declarative `itest_port` bindings too,
+# not just legacy autoassign_port / named_ports.
+itest_port(name = "reuseport_port")
+
+itest_service(
+    name = "reuseport_db",
+    args = [
+        "-so-reuseport",
+        "-port",
+        port_ref(":reuseport_port"),
+    ],
+    exe = "//go_service",
+    health_check_timeout = "5s",
+    http_health_check_address = "http://127.0.0.1:" + port_ref(":reuseport_port"),
+    ports = {":reuseport_port": "sql"},
+    so_reuseport_aware = True,
+    target_compatible_with = NOT_WINDOWS,
+)
+
+# select() lets a test suite be pointed at either the locally-managed service or the
+# production-like external instance.
+bool_flag(
+    name = "use_external",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "external",
+    flag_values = {":use_external": "True"},
+)
+
+go_test(
+    name = "_ports_test",
+    srcs = ["ports_test.go"],
+    tags = ["manual"],
+    deps = ["//svcctl"],
+)
+
+service_test(
+    name = "internal_test",
+    env = {
+        "EXPECT_PORT_TARGET": "@@//ports:db_port",
+        "EXPECT_SERVICE": "@@//ports:db",
+        "EXPECT_PORT_NAME": "sql",
+        "EXPECT_DOMAIN": "127.0.0.1",
+    },
+    services = [":db"],
+    test = ":_ports_test",
+)
+
+service_test(
+    name = "external_test",
+    env = {
+        "EXPECT_PORT_TARGET": "@@//ports:ext_db_port",
+        "EXPECT_SERVICE": "@@//ports:external_db",
+        "EXPECT_PORT_NAME": "sql",
+        "EXPECT_DOMAIN": "db.test.invalid",
+        "EXPECT_PORT": "5432",
+    },
+    services = [":external_db"],
+    test = ":_ports_test",
+)
+
+# Demonstrates swapping the service implementation with select().
+service_test(
+    name = "select_test",
+    services = select({
+        ":external": [":external_db"],
+        "//conditions:default": [":db"],
+    }),
+    test = "@rules_itest//:exit0",
+)
+
+# Targets used by the analysis-failure test in tests.bzl: binding the same port twice.
+itest_service(
+    name = "binder_a",
+    exe = "@rules_itest//:exit0",
+    hygienic = False,
+    ports = {":shared_port": "a"},
+    tags = ["manual"],
+)
+
+itest_service(
+    name = "binder_b",
+    exe = "@rules_itest//:exit0",
+    hygienic = False,
+    ports = {":shared_port": "b"},
+    tags = ["manual"],
+)
+
+itest_port(name = "shared_port")
+
+itest_service_group(
+    name = "double_bind",
+    hygienic = False,
+    services = [
+        ":binder_a",
+        ":binder_b",
+    ],
+    tags = ["manual"],
+)

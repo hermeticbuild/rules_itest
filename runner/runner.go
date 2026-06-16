@@ -50,6 +50,20 @@ func colorize(s svclib.VersionedServiceSpec) string {
 	return s.Colorize(s.Label)
 }
 
+// withHealthCheckTimeout wraps ctx with the service's health_check_timeout, if set.
+// The returned cancel func is always safe to call.
+func withHealthCheckTimeout(ctx context.Context, service *ServiceInstance) (context.Context, context.CancelFunc) {
+	if service.VersionedServiceSpec.HealthCheckTimeout == "" {
+		return context.WithCancel(ctx)
+	}
+	timeout, err := time.ParseDuration(service.VersionedServiceSpec.HealthCheckTimeout)
+	if err != nil {
+		log.Printf("failed to parse health check timeout, falling back to no timeout: %v", err)
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 	tasks := allTasks(r.serviceInstances, func(ctx context.Context, service *ServiceInstance) error {
 		if service.Type == "group" {
@@ -59,6 +73,16 @@ func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 		if service.Deferred {
 			log.Printf("Deferring %s\n", colorize(service.VersionedServiceSpec))
 			return nil
+		}
+
+		// External services are not spawned by us. If a health check is configured, we
+		// verify the external instance is reachable so dependents can order against it.
+		// We still honor health_check_timeout so an unreachable external dependency fails
+		// after the configured timeout instead of hanging until the outer test timeout.
+		if service.Type == "external_service" {
+			ctx, cancel := withHealthCheckTimeout(ctx, service)
+			defer cancel()
+			return service.WaitUntilHealthy(ctx)
 		}
 
 		if terseOutput {
@@ -79,15 +103,8 @@ func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 			}
 		}()
 
-		if service.VersionedServiceSpec.HealthCheckTimeout != "" {
-			timeout, err := time.ParseDuration(service.VersionedServiceSpec.HealthCheckTimeout)
-			if err != nil {
-				log.Printf("failed to parse health check timeout, falling back to no timeout: %v", err)
-			}
-			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-			ctx = timeoutCtx
-			defer cancel()
-		}
+		ctx, cancel := withHealthCheckTimeout(ctx, service)
+		defer cancel()
 		return service.WaitUntilHealthy(ctx)
 	})
 	starter := topological.NewRunner(tasks)
@@ -98,7 +115,7 @@ func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 
 func (r *Runner) StopAll() (map[string]*os.ProcessState, error) {
 	tasks := allTasks(r.serviceInstances, func(ctx context.Context, service *ServiceInstance) error {
-		if service.Type == "group" || service.Deferred {
+		if service.Type == "group" || service.Type == "external_service" || service.Deferred {
 			return nil
 		}
 		log.Printf("Stopping %s\n", colorize(service.VersionedServiceSpec))
@@ -110,7 +127,7 @@ func (r *Runner) StopAll() (map[string]*os.ProcessState, error) {
 	states := make(map[string]*os.ProcessState)
 
 	for _, serviceInstance := range r.serviceInstances {
-		if serviceInstance.Type == "group" || serviceInstance.Deferred {
+		if serviceInstance.Type == "group" || serviceInstance.Type == "external_service" || serviceInstance.Deferred {
 			continue
 		}
 		states[serviceInstance.Label] = serviceInstance.ProcessState()
@@ -182,7 +199,7 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 
 	for _, label := range updateActions.toStopLabels {
 		serviceInstance := r.serviceInstances[label]
-		if serviceInstance.Type == "group" {
+		if serviceInstance.Type == "group" || serviceInstance.Type == "external_service" {
 			continue
 		}
 		serviceInstance.Stop()
@@ -223,10 +240,12 @@ func (r *Runner) UpdateSpecsAndRestart(
 }
 
 func prepareServiceInstance(ctx context.Context, s svclib.VersionedServiceSpec) (*ServiceInstance, error) {
-	if s.Type == "group" {
+	// Neither groups nor external services are spawned, so they have no managed command.
+	if s.Type == "group" || s.Type == "external_service" {
 		return &ServiceInstance{
 			VersionedServiceSpec: s,
 			startErrFn:           sync.OnceValue(func() error { return nil }),
+			waitErrFn:            sync.OnceValue(func() error { return nil }),
 		}, nil
 	}
 
