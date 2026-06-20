@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"rules_itest/logger"
@@ -202,7 +203,7 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 		if err != nil {
 			// Service likely crashed — fall back to a full restart.
 			log.Printf(colorize(r.serviceInstances[label].VersionedServiceSpec) + " hot-reload stdin write failed, falling back to restart: " + err.Error())
-			r.serviceInstances[label].Stop(syscall.SIGKILL)
+			r.serviceInstances[label].StopWithSignal(syscall.SIGKILL)
 			delete(r.serviceInstances, label)
 			r.serviceInstances[label], err = prepareServiceInstance(r.ctx, serviceSpecs[label])
 			if err != nil {

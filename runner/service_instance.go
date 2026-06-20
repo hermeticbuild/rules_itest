@@ -249,8 +249,10 @@ func (s *ServiceInstance) StopWithSignal(signal syscall.Signal) error {
 		s.killed = true
 	}()
 
-	// If process already exited, nothing to kill.
+	// If process already exited, still attempt to clean up any remaining
+	// process group members (children may outlive the group leader).
 	if s.isDone() {
+		_ = killGroup(s.cmd, signal)
 		return nil
 	}
 
