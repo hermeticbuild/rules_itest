@@ -249,8 +249,9 @@ func (s *ServiceInstance) StopWithSignal(signal syscall.Signal) error {
 		s.killed = true
 	}()
 
-	if err != nil {
-		return err
+	// If process already exited, nothing to kill.
+	if s.isDone() {
+		return nil
 	}
 
 	if signal == syscall.SIGKILL {

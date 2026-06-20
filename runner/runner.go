@@ -200,7 +200,14 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 	for _, label := range updateActions.toReloadLabels {
 		_, err := r.serviceInstances[label].stdin.Write(ibazelCmd)
 		if err != nil {
-			return err
+			// Service likely crashed — fall back to a full restart.
+			log.Printf(colorize(r.serviceInstances[label].VersionedServiceSpec) + " hot-reload stdin write failed, falling back to restart: " + err.Error())
+			r.serviceInstances[label].Stop(syscall.SIGKILL)
+			delete(r.serviceInstances, label)
+			r.serviceInstances[label], err = prepareServiceInstance(r.ctx, serviceSpecs[label])
+			if err != nil {
+				return err
+			}
 		}
 	}
 

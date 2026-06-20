@@ -351,6 +351,50 @@ func main() {
 		if isOneShot {
 			break
 		}
+
+		if shouldHotReload && !enablePerServiceReload {
+			fmt.Println()
+			fmt.Println()
+			fmt.Println("###########################################################################################")
+			fmt.Println("  Detected that you are running under ibazel, but do not have per-service-reload enabled.")
+			fmt.Println("  In this configuration, services will not be restarted when their code changes.")
+			fmt.Println("  If this was unintentional, you can retry with per-service-reload enabled:")
+			fmt.Println("")
+			fmt.Printf("  `bazel run --@rules_itest//:enable_per_service_reload %s`\n", testLabel)
+			fmt.Println("###########################################################################################")
+			fmt.Println()
+			fmt.Println()
+		}
+
+		select {
+		case <-ctx.Done():
+			log.Println("Shutting down services.")
+			_, err := r.StopAll()
+			must(err)
+			log.Println("Cleaning up.")
+			return
+		case ibazelCmd := <-interactiveCh:
+			log.Println(ibazelCmd)
+
+			// Restart any services as needed.
+			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
+			must(err)
+
+			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+			must(err)
+
+			// Non-blocking drain of any pending service crash errors before restarting.
+			for {
+				select {
+				case <-servicesErrCh:
+				default:
+					goto drained
+				}
+			}
+		drained:
+			criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(ibazelCmd))
+			must(err)
+		}
 	}
 }
 
