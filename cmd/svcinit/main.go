@@ -285,12 +285,11 @@ func main() {
 
 			testCancel()
 
-			// This is a brittle way of draining a channel in a nonblocking way,
-			// consider instead signalling cancellation of the services with a
-			// context, letting them close the channel, and using a waitgroup to
-			// wait for them to exit.
-			// Non-blocking drain of any pending service crash errors before restarting.
-			// See: https://github.com/hermeticbuild/rules_itest/issues/72
+		// This is a brittle way of draining a channel in a nonblocking way,
+		// consider instead signalling cancellation of the services with a
+		// context, letting them close the channel, and using a waitgroup to
+		// wait for them to exit.
+		// See: https://github.com/hermeticbuild/rules_itest/issues/72
 		Drain:
 			for {
 				select {

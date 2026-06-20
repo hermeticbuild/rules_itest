@@ -251,6 +251,8 @@ func (s *ServiceInstance) StopWithSignal(signal syscall.Signal) error {
 
 	// If process already exited, still attempt to clean up any remaining
 	// process group members (children may outlive the group leader).
+	// Any error (ESRCH, EPERM) is intentionally discarded — the group leader
+	// is already done, so cleanup is best-effort.
 	if s.isDone() {
 		_ = killGroup(s.cmd, signal)
 		return nil
