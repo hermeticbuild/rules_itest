@@ -202,8 +202,12 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 		_, err := r.serviceInstances[label].stdin.Write(ibazelCmd)
 		if err != nil {
 			// Service likely crashed — fall back to a full restart.
-			log.Printf(colorize(r.serviceInstances[label].VersionedServiceSpec) + " hot-reload stdin write failed, falling back to restart: " + err.Error())
-			r.serviceInstances[label].StopWithSignal(syscall.SIGKILL)
+			old := r.serviceInstances[label]
+			log.Printf("%s hot-reload stdin write failed, falling back to restart: %v", colorize(old.VersionedServiceSpec), err)
+			old.stdin.Close()
+			if stopErr := old.StopWithSignal(syscall.SIGKILL); stopErr != nil {
+				log.Printf("%s stop during crash fallback failed: %v", colorize(old.VersionedServiceSpec), stopErr)
+			}
 			delete(r.serviceInstances, label)
 			r.serviceInstances[label], err = prepareServiceInstance(r.ctx, serviceSpecs[label])
 			if err != nil {

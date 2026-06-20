@@ -383,15 +383,16 @@ func main() {
 			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
 			must(err)
 
-			// Non-blocking drain of any pending service crash errors before restarting.
-			for {
-				select {
-				case <-servicesErrCh:
-				default:
-					goto drained
-				}
+		// Non-blocking drain of any pending service crash errors before restarting.
+		for {
+			select {
+			case crashErr := <-servicesErrCh:
+				log.Printf("Discarding pending service error before reload: %v", crashErr)
+			default:
+				goto drained
 			}
-		drained:
+		}
+	drained:
 			criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(ibazelCmd))
 			must(err)
 		}
