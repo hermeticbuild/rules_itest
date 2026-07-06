@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,9 +78,13 @@ func main() {
 		}()
 	}
 
-	// Sockets have a short max path length (108 chars) so the TEST_TMPDIR path is way too long.
-	// Put them in the OS temp location - note that this is per-test (i.e. hermetic) on linux anyway.
-	socketDir, err := os.MkdirTemp("", "")
+	// Unix sockets have a 108-character path limit, and the macOS temporary directory can exceed it.
+	// Use /tmp on macOS and Go's platform-specific temporary directory on other platforms.
+	socketTempDir := ""
+	if runtime.GOOS == "darwin" {
+		socketTempDir = "/tmp"
+	}
+	socketDir, err := os.MkdirTemp(socketTempDir, "")
 	must(err)
 	os.Setenv("SOCKET_DIR", socketDir)
 	defer os.RemoveAll(socketDir)
