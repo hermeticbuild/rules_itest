@@ -4,6 +4,7 @@ package svcctl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -187,7 +188,7 @@ func handleWait(ctx context.Context, r *runner.Runner, _ chan error, w http.Resp
 }
 
 type portHandler struct {
-	ports svclib.Ports
+	portsMap svclib.PortsMap
 }
 
 func (p portHandler) handle(ctx context.Context, r *runner.Runner, _ chan error, w http.ResponseWriter, req *http.Request) {
@@ -198,22 +199,53 @@ func (p portHandler) handle(ctx context.Context, r *runner.Runner, _ chan error,
 		return
 	}
 
-	port, ok := p.ports[service]
+	info, ok := p.portsMap[service]
 	if !ok {
 		http.Error(w, "port is not autoassigned", http.StatusBadRequest)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(port))
+	w.Write([]byte(info.Port))
 }
 
-func Serve(ctx context.Context, listener net.Listener, r *runner.Runner, ports svclib.Ports, servicesErrCh chan error) error {
+// portsHandler serves the full ITEST_PORTS_MAP (every port target/alias -> binding info).
+type portsHandler struct {
+	portsMap svclib.PortsMap
+}
+
+func (p portsHandler) handle(ctx context.Context, r *runner.Runner, _ chan error, w http.ResponseWriter, req *http.Request) {
+	writeJSON(w, p.portsMap)
+}
+
+// servicesHandler serves the full ITEST_SERVICES_MAP (every service -> port name -> binding info).
+type servicesHandler struct {
+	servicesMap svclib.ServicesMap
+}
+
+func (s servicesHandler) handle(ctx context.Context, r *runner.Runner, _ chan error, w http.ResponseWriter, req *http.Request) {
+	writeJSON(w, s.servicesMap)
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+func Serve(ctx context.Context, listener net.Listener, r *runner.Runner, portsMap svclib.PortsMap, servicesMap svclib.ServicesMap, servicesErrCh chan error) error {
 	mux := http.NewServeMux()
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/healthcheck", handleHealthCheck)
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/start", handleStart)
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/kill", handleKill)
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/wait", handleWait)
-	handle(ctx, mux, r, servicesErrCh, "GET /v0/port", portHandler{ports}.handle)
+	handle(ctx, mux, r, servicesErrCh, "GET /v0/port", portHandler{portsMap}.handle)
+	handle(ctx, mux, r, servicesErrCh, "GET /v0/ports", portsHandler{portsMap}.handle)
+	handle(ctx, mux, r, servicesErrCh, "GET /v0/services", servicesHandler{servicesMap}.handle)
 	return http.Serve(listener, mux)
 }
