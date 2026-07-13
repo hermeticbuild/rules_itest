@@ -210,6 +210,8 @@ func (p portHandler) handle(ctx context.Context, r *runner.Runner, _ chan error,
 
 func Serve(ctx context.Context, listener net.Listener, r *runner.Runner, ports svclib.Ports, servicesErrCh chan error) error {
 	mux := http.NewServeMux()
+	handle(ctx, mux, r, servicesErrCh, "GET /", handleUI)
+	handle(ctx, mux, r, servicesErrCh, "GET /v0/log", handleLog)
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/healthcheck", handleHealthCheck)
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/start", handleStart)
 	handle(ctx, mux, r, servicesErrCh, "GET /v0/kill", handleKill)

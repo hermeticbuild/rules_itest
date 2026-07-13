@@ -71,7 +71,15 @@ func main() {
 		w.Write([]byte(strconv.Itoa(fibSink)))
 	})
 
+	go func() {
+		for {
+			time.Sleep(100 * time.Millisecond)
+			log.Print("HIII STILL ALIVE")
+		}
+	}()
+
 	serve(*port, *soReuseport)
+
 }
 
 func fib(n int) int {

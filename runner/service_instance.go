@@ -21,6 +21,7 @@ import (
 type ServiceInstance struct {
 	svclib.VersionedServiceSpec
 	stdin io.WriteCloser
+	log   *os.File
 	cmd   *exec.Cmd
 
 	startTime     time.Time
@@ -305,7 +306,11 @@ func (s *ServiceInstance) StopWithSignal(signal syscall.Signal) error {
 		}
 	}
 
-	return nil
+	return s.log.Close()
+}
+
+func (s *ServiceInstance) LogPath() string {
+	return s.log.Name()
 }
 
 func (s *ServiceInstance) Wait() error {

@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -49,6 +50,16 @@ func New(ctx context.Context, serviceSpecs ServiceSpecs) (*Runner, error) {
 
 func colorize(s svclib.VersionedServiceSpec) string {
 	return s.Colorize(s.Label)
+}
+
+func (r *Runner) ServiceLabels() []string {
+	var labels []string
+	for label, service := range r.serviceInstances {
+		if service.Type == "service" {
+			labels = append(labels, label)
+		}
+	}
+	return labels
 }
 
 func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
@@ -242,11 +253,18 @@ func prepareServiceInstance(ctx context.Context, s svclib.VersionedServiceSpec) 
 		}, nil
 	}
 
-	instance := &ServiceInstance{
-		VersionedServiceSpec: s,
+	logPath := "/tmp/child.log"
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
 	}
 
-	err := initializeServiceCmd(ctx, instance)
+	instance := &ServiceInstance{
+		VersionedServiceSpec: s,
+		log:                  log,
+	}
+
+	err = initializeServiceCmd(ctx, instance)
 	if err != nil {
 		return nil, err
 	}
@@ -265,8 +283,14 @@ func initializeServiceCmd(ctx context.Context, instance *ServiceInstance) error 
 	for k, v := range s.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	cmd.Stdout = logger.New(s.Label+"> ", s.Color, os.Stdout)
-	cmd.Stderr = logger.New(s.Label+"> ", s.Color, os.Stderr)
+	cmd.Stdout = io.MultiWriter(
+		logger.New(s.Label+"> ", s.Color, os.Stdout),
+		instance.log,
+	)
+	cmd.Stderr = io.MultiWriter(
+		logger.New(s.Label+"> ", s.Color, os.Stderr),
+		instance.log,
+	)
 
 	if shouldUseProcessGroups {
 		setPgid(cmd)

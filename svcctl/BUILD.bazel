@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "svcctl",
-    srcs = ["svcctl.go"],
+    srcs = [
+        "svcctl.go",
+        "ui.go",
+    ],
     importpath = "rules_itest/svcctl",
     visibility = ["//visibility:public"],
     deps = [
