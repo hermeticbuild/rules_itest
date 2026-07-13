@@ -1,5 +1,12 @@
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
+REDIS_COPTS = [
+    # Redis intentionally performs unaligned 64-bit loads in siphash.c.
+    # The Zig toolchain enables alignment UB traps in fastbuild, which causes
+    # the server to crash on arm64 before it becomes healthy.
+    "-fno-sanitize=alignment",
+]
+
 cc_library(
     name = "linenoise",
     srcs = glob([
@@ -64,6 +71,7 @@ cc_library(
             "src/redis-cli.c",
         ],
     ) + ["release.h"],
+    copts = REDIS_COPTS,
     textual_hdrs = select({
         "@platforms//os:linux": ["src/ae_epoll.c"],
         "@platforms//os:osx": ["src/ae_kqueue.c", "src/ae_select.c"],

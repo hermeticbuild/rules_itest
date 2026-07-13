@@ -67,6 +67,8 @@ itest_service(
         "127.0.0.1",
         "--port",
         "$${PORT}",
+        "--socket",
+        "$${SOCKET_DIR}/mysql.sock",
     ],
     autoassign_port = True,
     exe = ":with_migrations",
