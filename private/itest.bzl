@@ -438,7 +438,7 @@ def _service_test_impl(ctx):
     ])
 
     return [
-        RunEnvironmentInfo(environment = fixed_env),
+        RunEnvironmentInfo(environment = fixed_env, inherited_environment = ctx.attr.env_inherit),
         DefaultInfo(runfiles = runfiles),
     ]
 
@@ -450,6 +450,9 @@ _service_test_attrs = {
     ),
     "env": attr.string_dict(
         doc = "The service manager will merge these variables into the environment when spawning the underlying binary.",
+    ),
+    "env_inherit": attr.string_list(
+        doc = "Env vars forwarded from the client env into the outer svcinit action's environment.",
     ),
     "data": attr.label_list(allow_files = True),
     ## This is taken directly from rules_go: https://github.com/bazel-contrib/rules_go/blob/85eef05357c9421eaa568d101e62355384bc49bb/go/private/rules/test.bzl#L442-L457
