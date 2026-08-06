@@ -6,7 +6,7 @@ const ports = JSON.parse(process.env.ASSIGNED_PORTS)
 
 for (const portName of [
   "@@//so_reuseport:reuseport_service",
-  "@@//so_reuseport:reuseport_service:named_port1",
+  "@@//so_reuseport:reuseport_service.named_port1",
 ]) {
   const port = ports[portName];
   assert(port);

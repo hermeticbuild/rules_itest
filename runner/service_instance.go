@@ -69,6 +69,19 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 		return err
 	}
 
+	// External services are not spawned by us, so there is no process to watch for exit.
+	// If a health check is configured, poll it; otherwise assume the service is reachable.
+	if s.Type == "external_service" {
+		if s.HttpHealthCheckAddress == "" && s.ServiceSpec.HealthCheck == "" {
+			return nil
+		}
+		if err := s.PollUntilHealthy(ctx); err != nil {
+			return err
+		}
+		log.Printf("%s healthy!\n", coloredLabel)
+		return nil
+	}
+
 	sleepDuration, err := time.ParseDuration(s.HealthCheckInterval)
 	if err != nil {
 		log.Printf("failed to parse health check time duration, falling back to 200ms: %v", err)
@@ -107,6 +120,25 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// PollUntilHealthy repeatedly runs the configured health check until it passes, the context is
+// cancelled/times out, or ctx errors. It does not watch a managed process, so it is suitable for
+// services the manager does not spawn (e.g. external services).
+func (s *ServiceInstance) PollUntilHealthy(ctx context.Context) error {
+	sleepDuration, err := time.ParseDuration(s.HealthCheckInterval)
+	if err != nil {
+		sleepDuration = 200 * time.Millisecond
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.HealthCheck(ctx, 0) {
+			return nil
+		}
+		time.Sleep(sleepDuration)
+	}
 }
 
 var httpClient = http.Client{
@@ -319,6 +351,9 @@ func (s *ServiceInstance) Wait() error {
 }
 
 func (s *ServiceInstance) Pid() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return -1
+	}
 	return s.cmd.Process.Pid
 }
 

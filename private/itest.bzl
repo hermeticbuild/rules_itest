@@ -21,7 +21,7 @@ forward the ibazel hot-reload notification over stdin instead of restarting the 
 # Service control
 
 The service manager exposes a HTTP server on `http://127.0.0.1:{SVCCTL_PORT}`. It can be used to
-start / stop services during a test run. There are currently 5 API endpoints available.
+start / stop services during a test run. There are currently 7 API endpoints available.
 All of them are GET requests:
 
 1. `/v0/healthcheck?service={label}`: Returns 200 if the service is healthy, 503 otherwise.
@@ -30,9 +30,35 @@ All of them are GET requests:
    You can optionally specify the signal to send to the service (valid values: SIGTERM and SIGKILL).
 4. `/v0/wait?service={label}`: Wait for the service to exit and returns the exit code in the body.
 5. `/v0/port?service={label}`: Returns the assigned port for the given label. May be a named port.
+6. `/v0/ports`: Returns the full `ITEST_PORTS_MAP` as JSON (every port target/alias -> binding info).
+7. `/v0/services`: Returns the full `ITEST_SERVICES_MAP` as JSON (every service -> port name -> binding info).
 
 In `bazel run` mode, the service manager will write the value of `SVCCTL_PORT` to `/tmp/svcctl_port`.
 This can be used in conjunction with the `/v0/port` API to let other tools interact with the managed services.
+
+# Ports, hostnames, and external services
+
+Ports can be declared as first-class targets with `itest_port`. A port is a handle whose value is an `int`
+build-setting flag (`0` = autoassign); the host/domain is supplied by the internal or external service that
+binds it. The value can be pinned from the command line via `--//pkg:my_port=8080`. A given port may only
+ever be bound once.
+
+`itest_external_service` points at a production or production-like instance reachable at a fixed FQDN.
+It provides the same information as an `itest_service`, so it can be swapped in for a local service using
+Bazel `select()` to run a test suite against production-like instances. External services are never started
+or stopped by the service manager; if a health check is configured, it is run to verify reachability.
+
+Two environment variables describe all bound ports/services (both internal and external). They are injected
+into the test binary and every child service, and are also available through the `/v0/ports` and `/v0/services`
+control APIs:
+
+- `ITEST_PORTS_MAP`: a JSON object keyed by port target label (and aliases):
+  `{"@@//pkg:my_port": {"origin": "127.0.0.1:54321", "domain": "127.0.0.1", "port": "54321"}, ...}`
+- `ITEST_SERVICES_MAP`: a JSON object keyed by service target label, then by port name (and aliases):
+  `{"@@//pkg:my_service": {"http": {"origin": "...", "domain": "...", "port": "..."}}, ...}`
+
+The legacy `ASSIGNED_PORTS` env var, the `GET_ASSIGNED_PORT_BIN` helper, and the `/v0/port` endpoint all
+continue to work as before.
 """
 
 load("@bazel_lib//lib:paths.bzl", "to_rlocation_path")
@@ -46,11 +72,80 @@ _ServiceGroupInfo = provider(
     },
 )
 
+_PortInfo = provider(
+    doc = "A handle for a port that can be bound by an internal or external service.",
+    fields = {
+        "label": "The canonical (fully-qualified) label of the port target.",
+        "aliases": "Additional keys that must resolve to the same port for backwards compatibility.",
+    },
+)
+
 def _collect_services(deps):
     services = {}
     for dep in deps:
         services |= dep[_ServiceGroupInfo].services
     return services
+
+def _validate_unique_port_bindings(services):
+    """Ensures every port target is bound by at most one service."""
+    seen = {}
+    for label, service in services.items():
+        bindings = getattr(service, "port_bindings", None)
+        if not bindings:
+            continue
+        for binding in bindings:
+            if binding.target in seen and seen[binding.target] != label:
+                fail("Port %s is bound by multiple services: %s and %s. A port may only be bound once." % (
+                    binding.target,
+                    seen[binding.target],
+                    label,
+                ))
+            seen[binding.target] = label
+
+def _port_binding(target, name, aliases, value):
+    """Constructs a single canonical port binding. Shared by internal and external services."""
+    return struct(
+        target = target,
+        name = name,
+        aliases = aliases,
+        value = value,
+    )
+
+def _bind_port_targets(ctx, value_fn):
+    """Builds bindings for each `itest_port` target in `ctx.attr.ports`.
+
+    `value_fn(port_target, name)` returns the desired value string for that binding, letting
+    internal services read it from the port flag while external services read it from `port_numbers`.
+    """
+    return [
+        _port_binding(
+            port_target[_PortInfo].label,
+            name,
+            port_target[_PortInfo].aliases,
+            value_fn(port_target, name),
+        )
+        for port_target, name in ctx.attr.ports.items()
+    ]
+
+def _compute_port_bindings(ctx):
+    """Builds the canonical, target-keyed list of port bindings for an internal service.
+
+    Legacy `autoassign_port` / `named_ports` are translated into bindings keyed by the
+    service's own label (so historical references keep working), and any explicit
+    `itest_port` targets in `ports` are bound using their `_PortInfo`.
+    """
+    bindings = []
+    label = str(ctx.label)
+
+    if ctx.attr.autoassign_port:
+        bindings.append(_port_binding(label, "", [], str(ctx.attr.port[BuildSettingInfo].value)))
+
+    for port_flag, name in ctx.attr.named_ports.items():
+        bindings.append(_port_binding(label + "." + name, name, [], str(port_flag[BuildSettingInfo].value)))
+
+    bindings += _bind_port_targets(ctx, lambda port_target, _name: str(port_target[BuildSettingInfo].value))
+
+    return bindings
 
 def _run_environment(ctx, service_specs_file):
     return {
@@ -162,17 +257,22 @@ def _itest_binary_impl(ctx, extra_service_spec_kwargs, extra_exe_runfiles = []):
         **extra_service_spec_kwargs
     )
 
+    direct_runfiles = [version_file] if version_file else []
+    transitive_runfiles = _services_runfiles(ctx, "data") + _services_runfiles(ctx, "deps") + exe_runfiles
+    return _finalize_service(ctx, service, direct_runfiles, transitive_runfiles)
+
+def _finalize_service(ctx, service, direct_runfiles = [], transitive_runfiles = []):
+    """Collects transitive services, emits the svcinit spec file, and returns the providers.
+
+    Shared by `_itest_binary_impl` (services/tasks) and `_itest_external_service_impl`.
+    """
     services = _collect_services(ctx.attr.deps)
     services[service.label] = service
 
     service_specs_file = _create_svcinit_actions(ctx, services)
 
-    direct_runfiles = ctx.files.data + [service_specs_file]
-    if version_file:
-        direct_runfiles.append(version_file)
-
-    runfiles = ctx.runfiles(direct_runfiles)
-    runfiles = runfiles.merge_all(_services_runfiles(ctx, "data") + _services_runfiles(ctx, "deps") + exe_runfiles)
+    runfiles = ctx.runfiles(ctx.files.data + [service_specs_file] + direct_runfiles)
+    runfiles = runfiles.merge_all(transitive_runfiles)
 
     return [
         RunEnvironmentInfo(environment = _run_environment(ctx, service_specs_file)),
@@ -196,7 +296,7 @@ def _itest_service_impl(ctx):
     if ctx.attr.health_check_timeout:
         _validate_duration("health_check_timeout", ctx.attr.health_check_timeout)
 
-    if ctx.attr.so_reuseport_aware and not (ctx.attr.autoassign_port or ctx.attr.named_ports):
+    if ctx.attr.so_reuseport_aware and not (ctx.attr.autoassign_port or ctx.attr.named_ports or ctx.attr.ports):
         fail("SO_REUSEPORT awareness only makes sense when using port autoassignment")
 
     shutdown_timeout = ctx.attr.shutdown_timeout or ctx.attr._default_shutdown_timeout[BuildSettingInfo].value
@@ -208,6 +308,8 @@ def _itest_service_impl(ctx):
         "autoassign_port": ctx.attr.autoassign_port,
         "so_reuseport_aware": ctx.attr.so_reuseport_aware,
         "deferred": ctx.attr.deferred,
+        "domain": ctx.attr.domain,
+        "port_bindings": _compute_port_bindings(ctx),
         "named_ports": {
             name: str(port_flag[BuildSettingInfo].value)
             for port_flag, name in ctx.attr.named_ports.items()
@@ -254,9 +356,20 @@ _itest_service_attrs = _itest_binary_attrs | {
         `PORT=$($GET_ASSIGNED_PORT_BIN @@//label/for:service)`""",
     ),
     "port": attr.label(doc = "Internal"),
+    "domain": attr.string(
+        default = "127.0.0.1",
+        doc = """The host that this service's ports are reachable on. Defaults to `127.0.0.1` for locally-managed services.""",
+    ),
+    "ports": attr.label_keyed_string_dict(
+        providers = [_PortInfo],
+        doc = """Maps `itest_port` targets that this service binds to a port name. The port name is used
+        as the inner key in `ITEST_SERVICES_MAP`. The desired value for each port is carried by the
+        `itest_port` target itself (an `int` flag, default `0` = autoassign), and can be pinned from the
+        command line via `--//pkg:my_port=8080`.""",
+    ),
     "named_ports": attr.label_keyed_string_dict(
         doc = """For each element of the list, the service manager will pick a free port and assign it to the service.
-        The port's fully-qualified name is the service's fully-qualified label and the port name, separated by a colon.
+        The port's fully-qualified name is the service's fully-qualified label and the port name, separated by a dot.
         For example, a port assigned with `named_ports = ["http_port"]` will be assigned a fully-qualified name of `@@//label/for:service.http_port`.
 
         Named ports are accessible through the service-port mapping. For more details, see `autoassign_port`.""",
@@ -329,6 +442,142 @@ itest_service = rule(
 All [common binary attributes](https://bazel.build/reference/be/common-definitions#common-attributes-binaries) are supported including `args`.""",
 )
 
+def _external_port_value(ctx, name):
+    if name not in ctx.attr.port_numbers:
+        fail("itest_external_service %s: no port number provided in `port_numbers` for port %r" % (ctx.label, name))
+    return ctx.attr.port_numbers[name]
+
+def _itest_external_service_impl(ctx):
+    _validate_deferred(ctx, ctx.attr.deps)
+
+    if ctx.attr.health_check_interval:
+        _validate_duration("health_check_interval", ctx.attr.health_check_interval)
+    if ctx.attr.health_check_timeout:
+        _validate_duration("health_check_timeout", ctx.attr.health_check_timeout)
+
+    bindings = _bind_port_targets(ctx, lambda _port_target, name: _external_port_value(ctx, name))
+
+    extra_service_spec_kwargs = {
+        "type": "external_service",
+        "domain": ctx.attr.domain,
+        "port_bindings": bindings,
+        "http_health_check_address": ctx.attr.http_health_check_address,
+        "expected_start_duration": ctx.attr.expected_start_duration,
+        "health_check_interval": ctx.attr.health_check_interval,
+        "health_check_timeout": ctx.attr.health_check_timeout,
+        "deferred": ctx.attr.deferred,
+    }
+    extra_exe_runfiles = []
+
+    if ctx.attr.health_check:
+        extra_service_spec_kwargs["health_check_label"] = str(ctx.attr.health_check.label)
+        extra_service_spec_kwargs["health_check"] = to_rlocation_path(ctx, ctx.executable.health_check)
+        extra_exe_runfiles.append(ctx.attr.health_check.default_runfiles)
+        extra_service_spec_kwargs["health_check_args"] = [
+            ctx.expand_location(arg, targets = ctx.attr.data)
+            for arg in ctx.attr.health_check_args
+        ]
+
+    service = struct(
+        label = str(ctx.label),
+        exe = "",
+        args = [],
+        env = {},
+        deps = [str(dep.label) for dep in ctx.attr.deps],
+        **extra_service_spec_kwargs
+    )
+
+    return _finalize_service(ctx, service, transitive_runfiles = _services_runfiles(ctx, "deps") + extra_exe_runfiles)
+
+_itest_external_service_attrs = {
+    "domain": attr.string(
+        mandatory = True,
+        doc = "The fully-qualified domain name (FQDN) that this external service is reachable on, e.g. `my_service.test.mycompany.com`.",
+    ),
+    "ports": attr.label_keyed_string_dict(
+        providers = [_PortInfo],
+        doc = "Maps `itest_port` targets that this external service exposes to a port name. Provide the literal port number for each name via `port_numbers`.",
+    ),
+    "port_numbers": attr.string_dict(
+        doc = "Maps each port name (from `ports`) to the literal port number it is reachable on at the FQDN.",
+    ),
+    "data": attr.label_list(allow_files = True),
+    "deps": attr.label_list(
+        providers = [_ServiceGroupInfo],
+        doc = "Services/tasks that must be available before this external service can be used.",
+    ),
+    "deferred": attr.bool(
+        doc = "If set, the external service will not be health-checked on boot up.",
+    ),
+    "http_health_check_address": attr.string(
+        doc = "If set, the service manager will send an HTTP request to this address to verify the external service is reachable. Port substitutions (including `$${<port>::origin}`) are supported.",
+    ),
+    "health_check": attr.label(
+        cfg = "target",
+        mandatory = False,
+        executable = True,
+        doc = "If set, the service manager will execute this binary to verify the external service is reachable.",
+    ),
+    "health_check_args": attr.string_list(
+        doc = "Arguments to pass to the health_check binary. Port substitutions are applied prior to execution.",
+    ),
+    "health_check_interval": attr.string(
+        default = "200ms",
+        doc = "The duration between each health check.",
+    ),
+    "health_check_timeout": attr.string(
+        default = "",
+        doc = "The timeout to wait for the health check. If empty, the health check will not have a timeout.",
+    ),
+    "expected_start_duration": attr.string(
+        default = "0s",
+        doc = "How long the service is expected to take before passing a health check. Failing checks before this elapses are not logged.",
+    ),
+} | _svcinit_attrs
+
+itest_external_service = rule(
+    implementation = _itest_external_service_impl,
+    attrs = _itest_external_service_attrs,
+    executable = True,
+    doc = """An itest_external_service points at a production or production-like instance of a service that is
+reachable at a fixed FQDN, rather than a binary that the service manager spawns locally.
+
+The service manager never starts or stops external services. If a health check is configured, it will be run
+to verify the external service is reachable before dependent services/tests run.
+
+Because it provides the same information as an `itest_service`, it can be swapped in for a local service using
+Bazel `select()` to run a test suite against production-like instances.""",
+)
+
+def _itest_port_impl(ctx):
+    return [
+        _PortInfo(
+            label = str(ctx.label),
+            aliases = ctx.attr.aliases,
+        ),
+        BuildSettingInfo(value = ctx.build_setting_value),
+    ]
+
+itest_port = rule(
+    implementation = _itest_port_impl,
+    build_setting = config.int(flag = True),
+    attrs = {
+        "aliases": attr.string_list(
+            doc = """Additional keys that must resolve to this port in `ITEST_PORTS_MAP` and the `ASSIGNED_PORTS`
+            map. Useful for keeping backwards-compatible references working. The port target's own label is
+            always bound, in addition to any aliases.""",
+        ),
+    },
+    doc = """Declares a port as a first-class target. A port is a pure handle: the host is supplied by the
+internal or external service that binds it, while the desired value is carried by the port target itself as
+an `int` build-setting flag (`0` = autoassign for internal services). A given port may only be bound by a
+single service.
+
+Because the port is a flag, its value can be pinned from the command line, e.g. `--//pkg:my_port=8080`.
+
+Ports are always referenced by their target label (e.g. via `port` / `port_ref`), and are bound exactly once.""",
+)
+
 def _itest_task_impl(ctx):
     return _itest_binary_impl(ctx, {
         "type": "task",
@@ -398,6 +647,8 @@ It can bring up multiple services with a single `bazel run` command, which is us
 )
 
 def _create_svcinit_actions(ctx, services):
+    _validate_unique_port_bindings(services)
+
     ctx.actions.symlink(
         output = ctx.outputs.executable,
         target_file = ctx.executable._svcinit,
