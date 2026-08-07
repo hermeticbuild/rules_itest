@@ -252,8 +252,8 @@ _itest_service_attrs = _itest_binary_attrs | {
         The assigned ports for all services are available for substitution in `http_health_check_address` and `args` (in case one service needs the address for another one.)
         For example, the following substitution: `args = ["-client-addr", "127.0.0.1:$${@@//label/for:service}"]`
 
-        The service-port mapping is a JSON string -> int map propagated through the `ASSIGNED_PORTS` env var.
-        For example, a port can be retrieved with the following JS code:
+        The service-port mapping is a JSON string -> string map propagated through the `ASSIGNED_PORTS` env var.
+        For example, a port (as a string) can be retrieved with the following JS code:
         `JSON.parse(process.env["ASSIGNED_PORTS"])["@@//label/for:service"]`.
 
         Alternately, the env will also contain the location of a binary that can return the port, for contexts without a readily-accessible JSON parser.
