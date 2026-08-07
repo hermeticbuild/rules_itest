@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"reflect"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -51,6 +53,18 @@ func colorize(s svclib.VersionedServiceSpec) string {
 	return s.Colorize(s.Label)
 }
 
+func formatCommandArgs(args []string) string {
+	if len(args) == 0 {
+		return "[]"
+	}
+
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = strconv.Quote(arg)
+	}
+	return "[" + strings.Join(quoted, " ") + "]"
+}
+
 func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 	tasks := allTasks(r.serviceInstances, func(ctx context.Context, service *ServiceInstance) error {
 		if service.Type == "group" {
@@ -65,7 +79,7 @@ func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 		if terseOutput {
 			log.Printf("Starting %s\n", colorize(service.VersionedServiceSpec))
 		} else {
-			log.Printf("Starting %s %v\n", colorize(service.VersionedServiceSpec), service.cmd.Args[1:])
+			log.Printf("Starting %s %s\n", colorize(service.VersionedServiceSpec), formatCommandArgs(service.cmd.Args[1:]))
 		}
 
 		startErr := service.Start(ctx)

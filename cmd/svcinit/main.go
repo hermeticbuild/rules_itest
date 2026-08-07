@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,9 @@ var (
 	enablePerServiceReload = os.Getenv("SVCINIT_ENABLE_PER_SERVICE_RELOAD") == "True"
 	shouldKeepServicesUp   = os.Getenv("SVCINIT_KEEP_SERVICES_UP") == "True"
 )
+
+const delegatedTargetFlag = "--target_arg"
+const delegatedTargetEnvFlag = "--target_env"
 
 // Assigned by x_def
 var getAssignedPortRlocationPath string
@@ -117,8 +121,12 @@ func main() {
 
 	isOneShot := !shouldHotReload && testLabel != "" && !shouldKeepServicesUp
 
-	unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
+	unversionedSpecs, aliases, err := readServiceSpecs(serviceSpecsPath)
 	must(err)
+	if testLabel == "" {
+		err = appendDelegatedTargetConfig(unversionedSpecs, aliases, os.Args[1:])
+		must(err)
+	}
 
 	// Make sure we grab the svcctl port before we assign test ports,
 	// otherwise we might steal an assigned port by accident.
@@ -284,19 +292,23 @@ func main() {
 			log.Println(ibazelCmd)
 
 			// Restart any services as needed.
-			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
+			unversionedSpecs, aliases, err := readServiceSpecs(serviceSpecsPath)
 			must(err)
+			if testLabel == "" {
+				err = appendDelegatedTargetConfig(unversionedSpecs, aliases, os.Args[1:])
+				must(err)
+			}
 
 			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
 			must(err)
 
 			testCancel()
 
-		// This is a brittle way of draining a channel in a nonblocking way,
-		// consider instead signalling cancellation of the services with a
-		// context, letting them close the channel, and using a waitgroup to
-		// wait for them to exit.
-		// See: https://github.com/hermeticbuild/rules_itest/issues/72
+			// This is a brittle way of draining a channel in a nonblocking way,
+			// consider instead signalling cancellation of the services with a
+			// context, letting them close the channel, and using a waitgroup to
+			// wait for them to exit.
+			// See: https://github.com/hermeticbuild/rules_itest/issues/72
 		Drain:
 			for {
 				select {
@@ -363,14 +375,26 @@ func main() {
 func readServiceSpecs(
 	path string,
 ) (
-	map[string]svclib.ServiceSpec, error,
+	map[string]svclib.ServiceSpec, map[string][]string, error,
 ) {
 	data, err := os.ReadFile(path)
 	must(err)
 
-	var serviceSpecs map[string]svclib.ServiceSpec
-	err = json.Unmarshal(data, &serviceSpecs)
-	return serviceSpecs, err
+	var graph struct {
+		Services map[string]svclib.ServiceSpec `json:"services"`
+		Aliases  map[string][]string           `json:"aliases"`
+	}
+	err = json.Unmarshal(data, &graph)
+	if err != nil {
+		return nil, nil, err
+	}
+	if graph.Services == nil {
+		graph.Services = map[string]svclib.ServiceSpec{}
+	}
+	if graph.Aliases == nil {
+		graph.Aliases = map[string][]string{}
+	}
+	return graph.Services, graph.Aliases, nil
 }
 
 func assignPorts(
@@ -650,6 +674,202 @@ func replaceAll(s string, replacements []Replacement) string {
 		s = strings.ReplaceAll(s, r.Old, r.New)
 	}
 	return s
+}
+
+type delegatedTargetConfig struct {
+	Args map[string][]string
+	Env  map[string]map[string]string
+}
+
+func appendDelegatedTargetConfig(serviceSpecs map[string]svclib.ServiceSpec, aliases map[string][]string, rawArgs []string) error {
+	config, err := parseDelegatedTargetConfig(rawArgs, serviceSpecs, aliases)
+	if err != nil {
+		return err
+	}
+
+	for label, args := range config.Args {
+		spec := serviceSpecs[label]
+		spec.Args = append(spec.Args, args...)
+		serviceSpecs[label] = spec
+	}
+	for label, env := range config.Env {
+		spec := serviceSpecs[label]
+		if spec.Env == nil {
+			spec.Env = map[string]string{}
+		}
+		for key, value := range env {
+			spec.Env[key] = value
+		}
+		serviceSpecs[label] = spec
+	}
+
+	return nil
+}
+
+func parseDelegatedTargetConfig(rawArgs []string, serviceSpecs map[string]svclib.ServiceSpec, aliases map[string][]string) (delegatedTargetConfig, error) {
+	config := delegatedTargetConfig{
+		Args: map[string][]string{},
+		Env:  map[string]map[string]string{},
+	}
+	currentTarget := ""
+
+	for i := 0; i < len(rawArgs); i++ {
+		arg := rawArgs[i]
+		switch {
+		case arg == delegatedTargetFlag:
+			if i+1 >= len(rawArgs) {
+				return delegatedTargetConfig{}, fmt.Errorf("missing target after %s", delegatedTargetFlag)
+			}
+			label, err := resolveDelegatedTarget(rawArgs[i+1], serviceSpecs, aliases)
+			if err != nil {
+				return delegatedTargetConfig{}, err
+			}
+			currentTarget = label
+			if _, ok := config.Args[label]; !ok {
+				config.Args[label] = nil
+			}
+			i++
+		case arg == delegatedTargetEnvFlag:
+			if i+2 >= len(rawArgs) {
+				return delegatedTargetConfig{}, fmt.Errorf("expected %s <target> <key=value>", delegatedTargetEnvFlag)
+			}
+			label, err := resolveDelegatedTarget(rawArgs[i+1], serviceSpecs, aliases)
+			if err != nil {
+				return delegatedTargetConfig{}, err
+			}
+			key, value, err := parseDelegatedEnvAssignment(rawArgs[i+2])
+			if err != nil {
+				return delegatedTargetConfig{}, err
+			}
+			if _, ok := config.Env[label]; !ok {
+				config.Env[label] = map[string]string{}
+			}
+			config.Env[label][key] = value
+			i += 2
+		default:
+			if currentTarget == "" {
+				return delegatedTargetConfig{}, fmt.Errorf("unexpected argument %q: expected %s <target> before delegated args", arg, delegatedTargetFlag)
+			}
+			config.Args[currentTarget] = append(config.Args[currentTarget], arg)
+		}
+	}
+
+	return config, nil
+}
+
+func parseDelegatedTargetArgs(rawArgs []string, serviceSpecs map[string]svclib.ServiceSpec, aliases map[string][]string) (map[string][]string, error) {
+	config, err := parseDelegatedTargetConfig(rawArgs, serviceSpecs, aliases)
+	if err != nil {
+		return nil, err
+	}
+
+	return config.Args, nil
+}
+
+func parseDelegatedEnvAssignment(raw string) (string, string, error) {
+	key, value, ok := strings.Cut(raw, "=")
+	if !ok || key == "" {
+		return "", "", fmt.Errorf("invalid delegated env assignment %q: expected KEY=VALUE", raw)
+	}
+	return key, value, nil
+}
+
+func resolveDelegatedTarget(target string, serviceSpecs map[string]svclib.ServiceSpec, aliases map[string][]string) (string, error) {
+	matches := []string{}
+	groupMatches := []string{}
+	for label, spec := range serviceSpecs {
+		if !delegatedTargetMatches(target, label) {
+			continue
+		}
+		if spec.Type == "group" {
+			groupMatches = append(groupMatches, label)
+			continue
+		}
+		matches = append(matches, label)
+	}
+	for alias, labels := range aliases {
+		if !delegatedTargetMatches(target, alias) {
+			continue
+		}
+		for _, label := range labels {
+			spec, ok := serviceSpecs[label]
+			if !ok {
+				return "", fmt.Errorf("delegated target alias %q points at unknown itest target %q", alias, label)
+			}
+			if spec.Type == "group" {
+				groupMatches = append(groupMatches, alias+" -> "+label)
+				continue
+			}
+			matches = append(matches, label)
+		}
+	}
+
+	matches = uniqueSorted(matches)
+	groupMatches = uniqueSorted(groupMatches)
+	sort.Strings(matches)
+	sort.Strings(groupMatches)
+
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		if len(groupMatches) > 0 {
+			return "", fmt.Errorf("delegated target %q refers to a non-executable itest_service_group: %s", target, strings.Join(groupMatches, ", "))
+		}
+		return "", fmt.Errorf("delegated target %q not found. Available executable itest targets: %s", target, strings.Join(executableItestTargets(serviceSpecs), ", "))
+	default:
+		return "", fmt.Errorf("delegated target %q is ambiguous. Matches: %s", target, strings.Join(matches, ", "))
+	}
+}
+
+func delegatedTargetMatches(target string, label string) bool {
+	if target == label {
+		return true
+	}
+
+	withoutModule := strings.TrimPrefix(label, "@@")
+	if target == withoutModule {
+		return true
+	}
+
+	colon := strings.LastIndex(label, ":")
+	if colon >= 0 {
+		targetName := label[colon+1:]
+		if target == targetName || target == ":"+targetName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func uniqueSorted(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := map[string]struct{}{}
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	sort.Strings(unique)
+	return unique
+}
+
+func executableItestTargets(serviceSpecs map[string]svclib.ServiceSpec) []string {
+	targets := make([]string, 0, len(serviceSpecs))
+	for label, spec := range serviceSpecs {
+		if spec.Type == "group" {
+			continue
+		}
+		targets = append(targets, label)
+	}
+	return uniqueSorted(targets)
 }
 
 func buildTestEnv(ports svclib.Ports) ([]string, error) {

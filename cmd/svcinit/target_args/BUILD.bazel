@@ -1,0 +1,62 @@
+load("@rules_go//go:def.bzl", "go_binary")
+load("@rules_itest//:itest.bzl", "itest_task")
+load(":target_args_test.bzl", "target_args_test")
+
+package(default_visibility = ["//visibility:public"])
+
+go_binary(
+    name = "capture_args",
+    srcs = ["capture_args.go"],
+)
+
+itest_task(
+    name = "dep_task",
+    args = ["dep-base"],
+    env = {
+        "OUTPUT_FILE": "dep_args.txt",
+        "TASK_NAME": "@@//cmd/svcinit/target_args:dep_task",
+    },
+    exe = ":capture_args",
+)
+
+alias(
+    name = "dep_alias",
+    actual = ":dep_task",
+)
+
+itest_task(
+    name = "top_task",
+    args = ["top-base"],
+    deps = [":dep_alias"],
+    env = {
+        "OUTPUT_FILE": "top_args.txt",
+        "TASK_NAME": "@@//cmd/svcinit/target_args:top_task",
+    },
+    exe = ":capture_args",
+)
+
+target_args_test(
+    name = "target_args_test",
+    argv = [
+        "--target_arg",
+        "top_task",
+        "--top-flag",
+        "--top-pair",
+        "with value",
+        "--target_env",
+        "//cmd/svcinit/target_args:top_task",
+        "INJECTED_ENV=top env value",
+        "--target_arg",
+        "dep_alias",
+        "--dep-flag",
+        "--dep-other",
+        "--target_env",
+        "//cmd/svcinit/target_args:dep_alias",
+        "INJECTED_ENV=dep env value",
+    ],
+    expected_files = {
+        "dep_args.txt": "TASK_NAME=@@//cmd/svcinit/target_args:dep_task\nINJECTED_ENV=dep env value\nARGS=dep-base\n--dep-flag\n--dep-other",
+        "top_args.txt": "TASK_NAME=@@//cmd/svcinit/target_args:top_task\nINJECTED_ENV=top env value\nARGS=top-base\n--top-flag\n--top-pair\nwith value",
+    },
+    target_under_test = ":top_task",
+)

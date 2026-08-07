@@ -60,7 +60,10 @@ go_library(
 
 go_test(
     name = "svcinit_test",
-    srcs = ["reserve_reusable_port_test.go"],
+    srcs = [
+        "reserve_reusable_port_test.go",
+        "target_args_test.go",
+    ],
     embed = [":svcinit_lib"],
 )
 

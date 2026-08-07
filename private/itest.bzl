@@ -18,6 +18,21 @@ query:enable-reload --@rules_itest//:enable_per_service_reload
 In addition, if the `hot_reloadable` attribute is set on an `itest_service`, the service manager will
 forward the ibazel hot-reload notification over stdin instead of restarting the service.
 
+When using `bazel run` on an executable `itest_service`, `itest_task`, or `itest_service_group`, you can
+delegate additional arguments and environment variables to executable `itest_*` targets in the dependency graph:
+
+```
+bazel run //path/to:target -- \
+  --target_env //path/to:some_task EXTRA_ENV=value \
+  --target_arg //path/to:some_task --flag value --other-flag "two words" \
+  --target_arg //path/to:service_alias --other-flag
+```
+
+Each `--target_arg` section appends its remaining arguments to that target's configured `args` until the next
+`--target_arg`. `--target_env <target> KEY=VALUE` injects or overrides an environment variable for that executable
+target. Targets are typically passed as their full label. Package-relative labels, target names, and Bazel alias
+that appears in the graph are also accepted.
+
 # Reusable port reservations
 
 For each service with `so_reuseport_aware = True`, the service manager adds
@@ -49,15 +64,27 @@ _ServiceGroupInfo = provider(
     doc = "Info about a service group",
     fields = {
         "deferred": "Flag if this service/task/group should be deferred or not",
+        "aliases": "Dict of alias labels to underlying target labels",
+        "roots": "Labels represented by this target",
         "services": "Dict of services/tasks",
     },
 )
 
-def _collect_services(deps):
+def _collect_graph(deps, dep_labels):
+    if len(deps) != len(dep_labels):
+        fail("Internal error: dep label metadata length mismatch for %s" % dep_labels)
+
     services = {}
-    for dep in deps:
-        services |= dep[_ServiceGroupInfo].services
-    return services
+    aliases = {}
+    for dep, dep_label in zip(deps, dep_labels):
+        info = dep[_ServiceGroupInfo]
+        services |= info.services
+        aliases |= info.aliases
+
+        if dep_label not in info.roots:
+            aliases[dep_label] = info.roots
+
+    return services, aliases
 
 def _run_environment(ctx, service_specs_file):
     return {
@@ -117,6 +144,7 @@ _itest_binary_attrs = {
         providers = [_ServiceGroupInfo],
         doc = "Services/tasks that must be started before this service/task can be started. Can be `itest_service`, `itest_task`, or `itest_service_group`.",
     ),
+    "dep_labels_internal": attr.string_list(doc = "Internal"),
 } | _svcinit_attrs
 
 def _compute_env(ctx, underlying_target):
@@ -169,10 +197,10 @@ def _itest_binary_impl(ctx, extra_service_spec_kwargs, extra_exe_runfiles = []):
         **extra_service_spec_kwargs
     )
 
-    services = _collect_services(ctx.attr.deps)
+    services, aliases = _collect_graph(ctx.attr.deps, ctx.attr.dep_labels_internal)
     services[service.label] = service
 
-    service_specs_file = _create_svcinit_actions(ctx, services)
+    service_specs_file = _create_svcinit_actions(ctx, services, aliases)
 
     direct_runfiles = ctx.files.data + [service_specs_file]
     if version_file:
@@ -184,7 +212,12 @@ def _itest_binary_impl(ctx, extra_service_spec_kwargs, extra_exe_runfiles = []):
     return [
         RunEnvironmentInfo(environment = _run_environment(ctx, service_specs_file)),
         DefaultInfo(runfiles = runfiles),
-        _ServiceGroupInfo(services = services, deferred = ctx.attr.deferred),
+        _ServiceGroupInfo(
+            services = services,
+            aliases = aliases,
+            roots = [service.label],
+            deferred = ctx.attr.deferred,
+        ),
     ]
 
 def _validate_duration(name, s):
@@ -355,7 +388,7 @@ All [common binary attributes](https://bazel.build/reference/be/common-definitio
 def _itest_service_group_impl(ctx):
     _validate_deferred(ctx, ctx.attr.services)
 
-    services = _collect_services(ctx.attr.services)
+    services, aliases = _collect_graph(ctx.attr.services, ctx.attr.service_labels_internal)
 
     service = struct(
         type = "group",
@@ -365,7 +398,7 @@ def _itest_service_group_impl(ctx):
     )
     services[service.label] = service
 
-    service_specs_file = _create_svcinit_actions(ctx, services)
+    service_specs_file = _create_svcinit_actions(ctx, services, aliases)
 
     runfiles = ctx.runfiles([service_specs_file])
     runfiles = runfiles.merge_all(_services_runfiles(ctx))
@@ -373,7 +406,12 @@ def _itest_service_group_impl(ctx):
     return [
         RunEnvironmentInfo(environment = _run_environment(ctx, service_specs_file)),
         DefaultInfo(runfiles = runfiles),
-        _ServiceGroupInfo(services = services, deferred = ctx.attr.deferred),
+        _ServiceGroupInfo(
+            services = services,
+            aliases = aliases,
+            roots = [service.label],
+            deferred = ctx.attr.deferred,
+        ),
     ]
 
 _itest_service_group_attrs = _svcinit_attrs | {
@@ -391,6 +429,7 @@ Use the functions `port_alias` and `named_port_alias` to reference ports from th
         providers = [_ServiceGroupInfo],
         doc = "Services/tasks that comprise this group. Can be `itest_service`, `itest_task`, or `itest_service_group`.",
     ),
+    "service_labels_internal": attr.string_list(doc = "Internal"),
 }
 
 itest_service_group = rule(
@@ -405,7 +444,7 @@ forcing the services within the group to define a specific startup ordering with
 It can bring up multiple services with a single `bazel run` command, which is useful for creating dev environments.""",
 )
 
-def _create_svcinit_actions(ctx, services):
+def _create_svcinit_actions(ctx, services, aliases):
     ctx.actions.symlink(
         output = ctx.outputs.executable,
         target_file = ctx.executable._svcinit,
@@ -414,7 +453,10 @@ def _create_svcinit_actions(ctx, services):
     # Avoid expanding during analysis phase.
     service_content = ctx.actions.args()
     service_content.set_param_file_format("multiline")
-    service_content.add_all([services], map_each = json.encode)
+    service_content.add_all([{
+        "services": services,
+        "aliases": aliases,
+    }], map_each = json.encode)
 
     service_specs_file = ctx.actions.declare_file(ctx.label.name + ".service_specs.json")
     ctx.actions.write(
@@ -425,9 +467,11 @@ def _create_svcinit_actions(ctx, services):
     return service_specs_file
 
 def _service_test_impl(ctx):
+    services, aliases = _collect_graph(ctx.attr.services, ctx.attr.service_labels_internal)
     service_specs_file = _create_svcinit_actions(
         ctx,
-        _collect_services(ctx.attr.services),
+        services,
+        aliases,
     )
 
     env_file = ctx.actions.declare_file(ctx.label.name + ".env.json")
@@ -460,6 +504,7 @@ _service_test_attrs = {
         doc = "The service manager will merge these variables into the environment when spawning the underlying binary.",
     ),
     "data": attr.label_list(allow_files = True),
+    "service_labels_internal": attr.string_list(doc = "Internal"),
     ## This is taken directly from rules_go: https://github.com/bazel-contrib/rules_go/blob/85eef05357c9421eaa568d101e62355384bc49bb/go/private/rules/test.bzl#L442-L457
     # Required for Bazel to merge coverage reports for Go and other
     # languages into a single report per test.
