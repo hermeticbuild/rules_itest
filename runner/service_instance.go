@@ -31,6 +31,7 @@ type ServiceInstance struct {
 
 	mu                   sync.Mutex
 	runErr               error
+	processState         *os.ProcessState
 	killed               bool
 	healthcheckAttempted bool
 	done                 bool
@@ -87,7 +88,7 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 		}
 
 		if s.isDone() {
-			state := s.cmd.ProcessState
+			state := s.ProcessState()
 			if state != nil {
 				return fmt.Errorf("%s exited before becoming healthy: %s", coloredLabel, state.String())
 			}
@@ -323,7 +324,9 @@ func (s *ServiceInstance) Pid() int {
 }
 
 func (s *ServiceInstance) ProcessState() *os.ProcessState {
-	return s.cmd.ProcessState
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.processState
 }
 
 // Returns true if killed by svcinit / svcctl instead of exited normally or crashed.
@@ -336,7 +339,7 @@ func (s *ServiceInstance) Killed() bool {
 func (s *ServiceInstance) isDone() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.done && s.cmd.ProcessState != nil
+	return s.done && s.processState != nil
 }
 
 func (s *ServiceInstance) isRunning() bool {
@@ -351,5 +354,12 @@ func (s *ServiceInstance) isRunning() bool {
 func (s *ServiceInstance) SetDone() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.done = true
+}
+
+func (s *ServiceInstance) setProcessState(state *os.ProcessState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.processState = state
 	s.done = true
 }
