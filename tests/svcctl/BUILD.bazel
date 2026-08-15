@@ -1,18 +1,12 @@
-load("@rules_go//go:def.bzl", "go_library", "go_test")
-load("@rules_itest//:itest.bzl", "service_test")
+load("@rules_go//go:def.bzl", "go_library")
+load("//:test_rules.bzl", "itest_go_test")
 
-go_test(
-    name = "_svcctl_test",
-    srcs = ["svcctl_test.go"],
-    tags = ["manual"],
-)
-
-service_test(
+itest_go_test(
     name = "svcctl_test",
+    srcs = ["svcctl_test.go"],
     services = [
         "//:services",
     ],
-    test = "_svcctl_test",
 )
 
 go_library(

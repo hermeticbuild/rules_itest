@@ -1,18 +1,11 @@
-load("@rules_go//go:def.bzl", "go_test")
-load("@rules_itest//:itest.bzl", "service_test")
+load("//:test_rules.bzl", "itest_go_test")
 
-go_test(
-    name = "_args_test",
-    srcs = ["args_test.go"],
-    tags = ["manual"],
-)
-
-service_test(
+itest_go_test(
     name = "args_test",
-    services = ["//:autoassigned"],
-    test = ":_args_test",
+    srcs = ["args_test.go"],
     args = [
         "--test-arg=hello",
         "--test-port=$${@@//:autoassigned}",
     ],
+    services = ["//:autoassigned"],
 )

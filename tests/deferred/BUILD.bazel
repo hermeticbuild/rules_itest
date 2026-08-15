@@ -1,5 +1,6 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
-load("@rules_itest//:itest.bzl", "itest_service", "itest_task", "service_test")
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_itest//:itest.bzl", "itest_service", "itest_task")
+load("//:test_rules.bzl", "itest_go_test")
 load(":tests.bzl", "tests")
 
 tests()
@@ -17,18 +18,12 @@ go_binary(
     visibility = ["//visibility:public"],
 )
 
-go_test(
-    name = "deferred_test",
+itest_go_test(
+    name = "deferred_service_test",
     srcs = ["start_deferred_service_test.go"],
     embed = [":deferred_lib"],
-    tags = ["manual"],
-    deps = ["//svcctl"],
-)
-
-service_test(
-    name = "deferred_service_test",
     services = [":deferred_itest_service"],
-    test = ":deferred_test",
+    deps = ["//svcctl"],
 )
 
 itest_service(
@@ -38,10 +33,10 @@ itest_service(
     ],
     autoassign_port = True,
     deferred = True,
-    deps = [":non_deferred_itest_service"],
     exe = ":deferred",
     http_health_check_address = "http://localhost:$${PORT}/healthz",
     tags = ["requires-network"],
+    deps = [":non_deferred_itest_service"],
 )
 
 itest_service(

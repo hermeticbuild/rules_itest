@@ -44,6 +44,7 @@ This can be used in conjunction with the `/v0/port` API to let other tools inter
 
 load("@bazel_lib//lib:paths.bzl", "to_rlocation_path")
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 
 _ServiceGroupInfo = provider(
     doc = "Info about a service group",
@@ -79,7 +80,7 @@ def _services_runfiles(ctx, services_attr_name = "services"):
         ctx.attr._svcinit.default_runfiles,
     ]
 
-_svcinit_attrs = {
+_SVCINIT_PRIVATE_ATTRS = {
     "_svcinit": attr.label(
         default = "//cmd/svcinit",
         executable = True,
@@ -96,6 +97,13 @@ _svcinit_attrs = {
     ),
     "_terse_svcinit_output": attr.label(
         default = "//:terse_svcinit_output",
+    ),
+}
+
+_ITEST_ATTRS = {
+    "services": attr.label_list(
+        providers = [_ServiceGroupInfo],
+        doc = "Services/tasks that comprise this group. Can be `itest_service`, `itest_task`, or `itest_service_group`.",
     ),
 }
 
@@ -117,7 +125,7 @@ _itest_binary_attrs = {
         providers = [_ServiceGroupInfo],
         doc = "Services/tasks that must be started before this service/task can be started. Can be `itest_service`, `itest_task`, or `itest_service_group`.",
     ),
-} | _svcinit_attrs
+} | _SVCINIT_PRIVATE_ATTRS
 
 def _compute_env(ctx, underlying_target):
     env = {
@@ -271,7 +279,7 @@ _itest_service_attrs = _itest_binary_attrs | {
     "so_reuseport_aware": attr.bool(
         doc = """If set, the service manager keeps a bind-only reservation for the autoassigned port for the service manager's lifetime.
         The service binary must use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows when binding it. This reduces the possibility of port
-        collisions when running many service_tests in parallel, or when code binds port 0 without being
+        collisions when running many integration tests in parallel, or when code binds port 0 without being
         aware of the port assignment mechanism.
 
         Must only be set when `autoassign_port` is enabled or `named_ports` are used.""",
@@ -322,7 +330,7 @@ _itest_service_attrs = _itest_binary_attrs | {
     ),
     "enforce_graceful_shutdown": attr.label(
         default = "//:enforce_graceful_shutdown",
-        doc = """If set to True, the service manager will fail the service_test if the service had to be forcefully killed if the signal was not SIGKILL and after the shutdown timeout elapsed.
+        doc = """If set to True, the service manager will fail the integration test if the service had to be forcefully killed if the signal was not SIGKILL and after the shutdown timeout elapsed.
 
         This needs to be False to have coverage of your services but don't want a them to be graceful at shutdown""",
     ),
@@ -376,7 +384,7 @@ def _itest_service_group_impl(ctx):
         _ServiceGroupInfo(services = services, deferred = ctx.attr.deferred),
     ]
 
-_itest_service_group_attrs = _svcinit_attrs | {
+_itest_service_group_attrs = _SVCINIT_PRIVATE_ATTRS | _ITEST_ATTRS | {
     "deferred": attr.bool(
         doc = """If set, the group will not be started on boot up. It can be started using the service manager's control API.""",
     ),
@@ -386,10 +394,6 @@ This can be used to create abstractions (such as an itest_service combined with 
 their implementation naming details through how client code accesses port names.
 
 Use the functions `port_alias` and `named_port_alias` to reference ports from the services to alias ports for""",
-    ),
-    "services": attr.label_list(
-        providers = [_ServiceGroupInfo],
-        doc = "Services/tasks that comprise this group. Can be `itest_service`, `itest_task`, or `itest_service_group`.",
     ),
 }
 
@@ -405,9 +409,9 @@ forcing the services within the group to define a specific startup ordering with
 It can bring up multiple services with a single `bazel run` command, which is useful for creating dev environments.""",
 )
 
-def _create_svcinit_actions(ctx, services):
+def _create_svcinit_actions(ctx, services, executable = None):
     ctx.actions.symlink(
-        output = ctx.outputs.executable,
+        output = executable or ctx.outputs.executable,
         target_file = ctx.executable._svcinit,
     )
 
@@ -424,83 +428,108 @@ def _create_svcinit_actions(ctx, services):
 
     return service_specs_file
 
-def _service_test_impl(ctx):
+def _parent_test_executable(ctx, default_info):
+    if default_info.files:
+        files = [
+            file
+            for file in default_info.files.to_list()
+            if file.owner == ctx.label
+        ]
+        if len(files) == 1:
+            return files[0]
+
+        for suffix in [".exe", ".bat", ".cmd", ""]:
+            matches = [
+                file
+                for file in files
+                if file.basename == ctx.label.name + suffix
+            ]
+            if len(matches) == 1:
+                return matches[0]
+
+    if default_info.default_runfiles:
+        launchers = [
+            file
+            for file in default_info.default_runfiles.files.to_list()
+            if file.owner == ctx.label and file.basename == ctx.label.name
+        ]
+        if len(launchers) == 1:
+            launcher = launchers[0]
+            if ctx.executable._svcinit.basename.endswith(".exe"):
+                return ctx.actions.declare_file(
+                    ctx.label.name + ".bat",
+                    sibling = launcher,
+                )
+            return launcher
+
+    fail("Cannot determine the parent test executable for %s" % ctx.label)
+
+def _itest_test_impl(ctx):
+    parent_default_info = None
+    parent_run_environment = None
+    providers = []
+
+    for parent_provider in ctx.super():
+        provider_type = type(parent_provider)
+        if provider_type == "DefaultInfo":
+            parent_default_info = parent_provider
+        elif provider_type == "RunEnvironmentInfo":
+            parent_run_environment = parent_provider
+        else:
+            providers.append(parent_provider)
+
+    if not parent_default_info:
+        fail("The parent test rule for %s must return DefaultInfo" % ctx.label)
+
+    parent_executable = _parent_test_executable(ctx, parent_default_info)
+    executable_suffix = ".exe" if ctx.executable._svcinit.basename.endswith(".exe") else ""
+    executable = ctx.actions.declare_file(ctx.label.name + ".itest" + executable_suffix)
     service_specs_file = _create_svcinit_actions(
         ctx,
         _collect_services(ctx.attr.services),
+        executable = executable,
     )
 
     env_file = ctx.actions.declare_file(ctx.label.name + ".env.json")
     ctx.actions.write(
         output = env_file,
-        content = json.encode(_compute_env(ctx, ctx.attr.test)),
+        content = json.encode(parent_run_environment.environment if parent_run_environment else {}),
     )
 
     fixed_env = _run_environment(ctx, service_specs_file)
-    fixed_env["SVCINIT_TEST_RLOCATION_PATH"] = to_rlocation_path(ctx, ctx.executable.test)
+    fixed_env["SVCINIT_TEST_RLOCATION_PATH"] = to_rlocation_path(ctx, parent_executable)
     fixed_env["SVCINIT_TEST_ENV_RLOCATION_PATH"] = to_rlocation_path(ctx, env_file)
 
-    runfiles = ctx.runfiles(ctx.files.data + [service_specs_file, env_file])
-    runfiles = runfiles.merge_all(_services_runfiles(ctx) + [
-        ctx.attr.test.default_runfiles,
-    ])
+    runfiles = ctx.runfiles([service_specs_file, env_file, parent_executable])
+    parent_runfiles = parent_default_info.default_runfiles
+    runfiles = runfiles.merge_all(_services_runfiles(ctx) + ([parent_runfiles] if parent_runfiles else []))
+    parent_files = [parent_default_info.files] if parent_default_info.files else []
 
-    return [
-        RunEnvironmentInfo(environment = fixed_env),
-        DefaultInfo(runfiles = runfiles),
+    return providers + [
+        RunEnvironmentInfo(
+            environment = fixed_env,
+            inherited_environment = parent_run_environment.inherited_environment if parent_run_environment else [],
+        ),
+        DefaultInfo(
+            executable = executable,
+            files = depset([executable], transitive = parent_files),
+            runfiles = runfiles,
+        ),
     ]
 
-_service_test_attrs = {
-    "test": attr.label(
-        cfg = "target",
-        executable = True,
-        doc = "The underlying test target to execute once the services have been brought up and healthchecked.",
-    ),
-    "env": attr.string_dict(
-        doc = "The service manager will merge these variables into the environment when spawning the underlying binary.",
-    ),
-    "data": attr.label_list(allow_files = True),
-    ## This is taken directly from rules_go: https://github.com/bazel-contrib/rules_go/blob/85eef05357c9421eaa568d101e62355384bc49bb/go/private/rules/test.bzl#L442-L457
-    # Required for Bazel to merge coverage reports for Go and other
-    # languages into a single report per test.
-    # Using configuration_field ensures that the tool is only built when
-    # run with bazel coverage, not with bazel test.
-    "_lcov_merger": attr.label(
-        default = configuration_field(fragment = "coverage", name = "output_generator"),
-        cfg = "exec",
-    ),
-} | _itest_service_group_attrs
+def _itest_test_initializer(data = [], services = [], **_kwargs):
+    return {"data": data + services}
 
-service_test = rule(
-    implementation = _service_test_impl,
-    attrs = _service_test_attrs,
-    test = True,
-    doc = """Brings up a set of services/tasks and runs a test target against them.
+def extend_test_rule(parent):
+    """Extends a test rule with services started before the test executes."""
+    return rule(
+        implementation = _itest_test_impl,
+        initializer = _itest_test_initializer,
+        parent = parent,
+        attrs = _ITEST_ATTRS | _SVCINIT_PRIVATE_ATTRS,
+    )
 
-This can be used to customize which services a particular test needs while being able to bring them up in an easy and consistent way.
-
-Example usage:
-```
-go_test(
-    name = "_example_test_no_services",
-    srcs = [..],
-    tags = ["manual"],
-)
-
-service_test(
-    name = "example_test",
-    test = ":_example_test_no_services",
-    services = [
-        "//services/mysql",
-        ...
-    ],
-)
-```
-
-Typically this would be wrapped into a macro.
-
-All [common binary attributes](https://bazel.build/reference/be/common-definitions#common-attributes-binaries) are supported including `args`.""",
-)
+itest_hygiene_test = extend_test_rule(native_test)
 
 def _create_version_file(ctx, inputs):
     if not ctx.attr._enable_per_service_reload[BuildSettingInfo].value:
