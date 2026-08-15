@@ -106,6 +106,7 @@ def itest_task(name, tags = [], hygienic = True, **kwargs):
 def _hygiene_test(name, **kwargs):
     _itest_hygiene_test(
         name = name + "_hygiene_test",
+        src = "@rules_itest//:exit0",
         services = [name],
         **kwargs
     )

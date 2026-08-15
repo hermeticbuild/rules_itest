@@ -1,7 +1,7 @@
 load("@rules_itest//:itest.bzl", "itest_service")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//:must_fail.bzl", "must_fail")
-load("//:test_rules.bzl", "itest_sh_test")
+load("//:test_rules.bzl", "itest_native_test")
 load(":cleanup_failure_test.bzl", "cleanup_failure_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -66,10 +66,10 @@ itest_service(
     deps = [":cleanup_service"],
 )
 
-itest_sh_test(
+itest_native_test(
     name = "dependent_startup_failure_test",
     timeout = "short",
-    srcs = ["//:empty.sh"],
+    src = "@rules_itest//:exit0",
     services = [":dependent_immediate_exit_service"],
     tags = ["manual"],
 )

@@ -9,10 +9,19 @@ env = {
 }
 
 itest_go_test(
-    name = "env_test",
+    name = "env_specified_in_base",
     srcs = ["env_test.go"],
     data = [":test.txt"],
     env = env,
+    deps = ["@rules_go//go/runfiles"],
+)
+
+itest_go_test(
+    name = "env_specified_in_task",
+    srcs = ["env_test.go"],
+    data = [":test.txt"],
+    env = env,
+    services = [":task_sh"],
     deps = ["@rules_go//go/runfiles"],
 )
 
@@ -33,15 +42,11 @@ itest_task(
 sh_binary(
     name = "_task_sh",
     srcs = ["task.sh"],
-    data = [
-        ":test.txt",
-    ],
-    env = env,
 )
 
 itest_task(
     name = "task_sh",
+    data = [":test.txt"],
+    env = env,
     exe = ":_task_sh",
-    # sh_binary does not provide RunEnvironmentInfo.
-    tags = ["manual"],
 )

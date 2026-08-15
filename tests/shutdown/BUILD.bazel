@@ -2,7 +2,7 @@ load("@aspect_rules_js//js:defs.bzl", "js_binary")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_itest//:itest.bzl", "itest_service")
 load("//:must_fail.bzl", "must_fail")
-load("//:test_rules.bzl", "itest_sh_test")
+load("//:test_rules.bzl", "itest_native_test")
 
 bool_flag(
     name = "enforce_graceful_shutdown",
@@ -55,22 +55,22 @@ itest_service(
     tags = ["manual"],
 )
 
-itest_sh_test(
+itest_native_test(
     name = "graceful_shutdown_test",
-    srcs = ["//:empty.sh"],
+    src = "@rules_itest//:exit0",
     services = [":service_graceful"],
 )
 
-itest_sh_test(
+itest_native_test(
     name = "timeout_shutdown_test",
-    srcs = ["//:empty.sh"],
+    src = "@rules_itest//:exit0",
     services = [":service_timeout_error"],
     tags = ["manual"],
 )
 
-itest_sh_test(
+itest_native_test(
     name = "timeout_shutdown_no_error_test",
-    srcs = ["//:empty.sh"],
+    src = "@rules_itest//:exit0",
     services = [":service_timeout_no_error"],
     tags = ["manual"],
 )

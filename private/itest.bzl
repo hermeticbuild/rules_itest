@@ -44,6 +44,7 @@ This can be used in conjunction with the `/v0/port` API to let other tools inter
 
 load("@bazel_lib//lib:paths.bzl", "to_rlocation_path")
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 
 _ServiceGroupInfo = provider(
     doc = "Info about a service group",
@@ -410,7 +411,7 @@ It can bring up multiple services with a single `bazel run` command, which is us
 
 def _create_svcinit_actions(ctx, services, executable = None):
     ctx.actions.symlink(
-        output = executable if executable else ctx.outputs.executable,
+        output = executable or ctx.outputs.executable,
         target_file = ctx.executable._svcinit,
     )
 
@@ -528,36 +529,7 @@ def extend_test_rule(parent):
         attrs = _ITEST_ATTRS | _SVCINIT_PRIVATE_ATTRS,
     )
 
-def _hygiene_parent_impl(ctx):
-    executable_suffix = ".exe" if ctx.executable._exit0.basename.endswith(".exe") else ""
-    executable = ctx.actions.declare_file(ctx.label.name + ".hygiene" + executable_suffix)
-    ctx.actions.symlink(
-        output = executable,
-        target_file = ctx.executable._exit0,
-        is_executable = True,
-    )
-    runfiles = ctx.runfiles([ctx.executable._exit0])
-    runfiles = runfiles.merge(ctx.attr._exit0[DefaultInfo].default_runfiles)
-    return [DefaultInfo(
-        executable = executable,
-        files = depset([executable]),
-        runfiles = runfiles,
-    )]
-
-_hygiene_parent_test = rule(
-    implementation = _hygiene_parent_impl,
-    attrs = {
-        "data": attr.label_list(allow_files = True),
-        "_exit0": attr.label(
-            default = "//:exit0",
-            executable = True,
-            cfg = "target",
-        ),
-    },
-    test = True,
-)
-
-itest_hygiene_test = extend_test_rule(_hygiene_parent_test)
+itest_hygiene_test = extend_test_rule(native_test)
 
 def _create_version_file(ctx, inputs):
     if not ctx.attr._enable_per_service_reload[BuildSettingInfo].value:
