@@ -3,10 +3,11 @@
 load("@bazel_skylib//rules:common_settings.bzl", "int_flag")
 load(
     "//private:itest.bzl",
+    _extend_test_rule = "extend_test_rule",
+    _itest_hygiene_test = "itest_hygiene_test",
     _itest_service = "itest_service",
     _itest_service_group = "itest_service_group",
     _itest_task = "itest_task",
-    _service_test = "service_test",
 )
 
 def _to_relative_port(label):
@@ -103,11 +104,10 @@ def itest_task(name, tags = [], hygienic = True, **kwargs):
         )
 
 def _hygiene_test(name, **kwargs):
-    service_test(
+    _itest_hygiene_test(
         name = name + "_hygiene_test",
         services = [name],
-        test = "@rules_itest//:exit0",
         **kwargs
     )
 
-service_test = _service_test
+extend_test_rule = _extend_test_rule

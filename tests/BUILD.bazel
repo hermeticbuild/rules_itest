@@ -3,7 +3,10 @@ load("@rules_itest//:itest.bzl", "itest_service", "itest_service_group", "named_
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["not.sh"])
+exports_files([
+    "empty.sh",
+    "not.sh",
+])
 
 gazelle(name = "gazelle")
 
@@ -85,7 +88,7 @@ itest_service(
     name = "named_port",
     args = [
         "-port",
-        named_port(":named_port", "http_port")
+        named_port(":named_port", "http_port"),
     ],
     autoassign_port = True,
     exe = "//go_service",

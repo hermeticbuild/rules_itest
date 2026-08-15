@@ -1,6 +1,6 @@
-load("@rules_itest//:itest.bzl", "itest_task", "service_test")
+load("@rules_itest//:itest.bzl", "itest_task")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//:test_rules.bzl", "itest_sh_test")
 
 sh_binary(
     name = "write_to_file",
@@ -21,16 +21,8 @@ MESSAGE = "hello world"
     for i in range(len(MESSAGE))
 ]
 
-sh_test(
-    name = "_dependencies_test",
-    srcs = ["test.sh"],
-    tags = ["manual"],
-)
-
-service_test(
+itest_sh_test(
     name = "dependencies_test",
-    services = [
-        ":write_10",
-    ],
-    test = ":_dependencies_test",
+    srcs = ["test.sh"],
+    services = [":write_10"],
 )

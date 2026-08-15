@@ -1,6 +1,6 @@
-load("@rules_go//go:def.bzl", "go_test")
-load("@rules_itest//:itest.bzl", "itest_service", "service_test")
+load("@rules_itest//:itest.bzl", "itest_service")
 load("//:must_fail.bzl", "must_fail")
+load("//:test_rules.bzl", "itest_go_test")
 
 itest_service(
     name = "crashing_service",
@@ -21,17 +21,11 @@ must_fail(
     test = "_crash_test",
 )
 
-service_test(
+itest_go_test(
     name = "_crash_test",
+    srcs = ["crash_test.go"],
     services = [
         ":crashing_service",
     ],
-    tags = ["manual"],
-    test = ":crashing_service_test",
-)
-
-go_test(
-    name = "crashing_service_test",
-    srcs = ["crash_test.go"],
     tags = ["manual"],
 )

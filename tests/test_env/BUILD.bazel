@@ -1,47 +1,19 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("@rules_go//go:def.bzl", "go_test")
-load("@rules_itest//:itest.bzl", "itest_task", "service_test")
+load("@rules_itest//:itest.bzl", "itest_task")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//:test_rules.bzl", "itest_go_test")
 
 env = {
     "ITEST_ENV_VAR": "ITEST_ENV_VAR_VALUE",
     "ENV_RUNFILE": "$(rlocationpath :test.txt)",
 }
 
-go_test(
-    name = "test_env_test",
+itest_go_test(
+    name = "env_test",
     srcs = ["env_test.go"],
-    data = [
-        ":test.txt",
-    ],
+    data = [":test.txt"],
     env = env,
-    tags = ["manual"],
-    deps = [
-        "@rules_go//go/runfiles",
-    ],
-)
-
-service_test(
-    name = "env_specified_in_base",
-    test = ":test_env_test",
-)
-
-go_test(
-    name = "_env_not_specified",
-    srcs = ["env_test.go"],
-    tags = ["manual"],
-    deps = [
-        "@rules_go//go/runfiles:go_default_library",
-    ],
-)
-
-service_test(
-    name = "env_specified_in_service_test",
-    data = [
-        ":test.txt",
-    ],
-    env = env,
-    test = ":_env_not_specified",
+    deps = ["@rules_go//go/runfiles"],
 )
 
 cc_binary(

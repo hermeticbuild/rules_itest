@@ -1,7 +1,6 @@
-load("@aspect_rules_js//js:defs.bzl", "js_test")
-load("@rules_go//go:def.bzl", "go_test")
-load("@rules_itest//:itest.bzl", "itest_service", "service_test")
+load("@rules_itest//:itest.bzl", "itest_service")
 load("//:must_fail.bzl", "must_fail")
+load("//:test_rules.bzl", "itest_go_test", "itest_js_test")
 
 itest_service(
     name = "reuseport_service",
@@ -40,26 +39,18 @@ must_fail(
     test = "_no_reuseport_service_hygiene_test",
 )
 
-go_test(
-    name = "_so_reuseport_test",
-    srcs = ["so_reuseport_test.go"],
-    tags = ["manual"],
-)
-
-service_test(
+itest_go_test(
     name = "so_reuseport_test",
+    srcs = ["so_reuseport_test.go"],
     services = [":reuseport_service"],
-    test = ":_so_reuseport_test",
 )
 
-js_test(
-    name = "_so_reuseport_js_test",
-    entry_point = "so_reuseport_test.mjs",
-    tags = ["manual"],
-)
-
-service_test(
+itest_js_test(
     name = "so_reuseport_js_test",
+    enable_runfiles = select({
+        "@aspect_bazel_lib//lib:enable_runfiles": True,
+        "//conditions:default": False,
+    }),
+    entry_point = "so_reuseport_test.mjs",
     services = [":reuseport_service"],
-    test = ":_so_reuseport_js_test",
 )
