@@ -3,6 +3,7 @@
 load("@bazel_skylib//rules:common_settings.bzl", "int_flag")
 load(
     "//private:itest.bzl",
+    _itest_local_environment = "itest_local_environment",
     _itest_service = "itest_service",
     _itest_service_group = "itest_service_group",
     _itest_task = "itest_task",
@@ -43,13 +44,14 @@ def named_port_alias(label, name):
     """
     return _to_relative_named_port(label, name)
 
-def itest_service(name, tags = [], hygienic = True, named_ports = [], **kwargs):
+def itest_service(name, tags = [], hygienic = True, named_ports = [], visibility = None, **kwargs):
     if "port" in kwargs:
         fail("Do not specify `port`, instead set it via the `%s` flag" % (name + ".port"))
 
     int_flag(
         name = name + ".port",
         build_setting_default = 0,
+        visibility = visibility,
     )
 
     named_ports_attr = {}
@@ -60,6 +62,7 @@ def itest_service(name, tags = [], hygienic = True, named_ports = [], **kwargs):
         int_flag(
             name = named_port_label,
             build_setting_default = 0,
+            visibility = visibility,
         )
 
     _itest_service(
@@ -67,6 +70,7 @@ def itest_service(name, tags = [], hygienic = True, named_ports = [], **kwargs):
         tags = tags + ["ibazel_notify_changes"],
         port = name + ".port",
         named_ports = named_ports_attr,
+        visibility = visibility,
         **kwargs
     )
 
@@ -101,6 +105,13 @@ def itest_task(name, tags = [], hygienic = True, **kwargs):
             name = name,
             tags = tags,
         )
+
+def itest_local_environment(name, tags = [], **kwargs):
+    _itest_local_environment(
+        name = name,
+        tags = tags + ["ibazel_notify_changes"],
+        **kwargs
+    )
 
 def _hygiene_test(name, **kwargs):
     service_test(

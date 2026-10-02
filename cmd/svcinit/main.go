@@ -120,6 +120,11 @@ func main() {
 	unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
 	must(err)
 
+	// Apply port overrides from SVCINIT_PORT_OVERRIDES if present
+	if portOverridesJSON := os.Getenv("SVCINIT_PORT_OVERRIDES"); portOverridesJSON != "" {
+		must(applyPortOverrides(unversionedSpecs, portOverridesJSON))
+	}
+
 	// Make sure we grab the svcctl port before we assign test ports,
 	// otherwise we might steal an assigned port by accident.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -287,6 +292,11 @@ func main() {
 			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
 			must(err)
 
+			// Apply port overrides (same as initial load)
+			if portOverridesJSON := os.Getenv("SVCINIT_PORT_OVERRIDES"); portOverridesJSON != "" {
+				must(applyPortOverrides(unversionedSpecs, portOverridesJSON))
+			}
+
 			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
 			must(err)
 
@@ -371,6 +381,71 @@ func readServiceSpecs(
 	var serviceSpecs map[string]svclib.ServiceSpec
 	err = json.Unmarshal(data, &serviceSpecs)
 	return serviceSpecs, err
+}
+
+type portRef struct {
+	serviceLabel string
+	portName     string
+}
+
+// applyPortOverrides applies port overrides from a JSON-encoded map.
+// The map keys are port labels (e.g., "@@//pkg:service.port" or "@@//pkg:service.admin.http")
+// and the values are the port numbers to assign.
+func applyPortOverrides(specs map[string]svclib.ServiceSpec, overridesJSON string) error {
+	var overrides map[string]string
+	if err := json.Unmarshal([]byte(overridesJSON), &overrides); err != nil {
+		return fmt.Errorf("failed to parse SVCINIT_PORT_OVERRIDES: %w", err)
+	}
+
+	// Build lookup map: port label -> (serviceLabel, portName)
+	portLabelMap := make(map[string]portRef, len(specs)*2)
+	for label, spec := range specs {
+		// Main port
+		portLabelMap[label+".port"] = portRef{label, "port"}
+		// Named ports
+		for namedPort := range spec.NamedPorts {
+			portLabelMap[label+"."+namedPort] = portRef{label, namedPort}
+		}
+	}
+
+	for portLabel, portValue := range overrides {
+		ref, ok := portLabelMap[portLabel]
+		if !ok {
+			return fmt.Errorf("port override %q does not match any known service or port", portLabel)
+		}
+
+		spec := specs[ref.serviceLabel]
+
+		if ref.portName == "port" {
+			// Main port override - only apply if not already set by Bazel flag
+			if spec.Port != "0" && spec.Port != "" {
+				if !terseOutput {
+					log.Printf("Skipping port override %s (Bazel flag already set port to %s)", portLabel, spec.Port)
+				}
+				continue
+			}
+			spec.Port = portValue
+		} else {
+			// Named port override - only apply if not already set by Bazel flag
+			currentValue := spec.NamedPorts[ref.portName]
+			if currentValue != "0" && currentValue != "" {
+				if !terseOutput {
+					log.Printf("Skipping port override %s (Bazel flag already set port to %s)", portLabel, currentValue)
+				}
+				continue
+			}
+			if spec.NamedPorts == nil {
+				spec.NamedPorts = make(map[string]string)
+			}
+			spec.NamedPorts[ref.portName] = portValue
+		}
+
+		if !terseOutput {
+			log.Printf("Applying port override: %s = %s", portLabel, portValue)
+		}
+		specs[ref.serviceLabel] = spec
+	}
+	return nil
 }
 
 func assignPorts(
