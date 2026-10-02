@@ -79,10 +79,10 @@ func main() {
 		}()
 	}
 
-	// Unix sockets have a 108-character path limit, and the macOS temporary directory can exceed it.
-	// Use /tmp on macOS and Go's platform-specific temporary directory on other platforms.
+	// Sockets have a short max path length (108 chars on Linux, 103 usable
+	// chars on Darwin), so use /tmp instead of the long TEST_TMPDIR path.
 	socketTempDir := ""
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS != "windows" {
 		socketTempDir = "/tmp"
 	}
 	socketDir, err := os.MkdirTemp(socketTempDir, "")
@@ -292,11 +292,11 @@ func main() {
 
 			testCancel()
 
-		// This is a brittle way of draining a channel in a nonblocking way,
-		// consider instead signalling cancellation of the services with a
-		// context, letting them close the channel, and using a waitgroup to
-		// wait for them to exit.
-		// See: https://github.com/hermeticbuild/rules_itest/issues/72
+			// This is a brittle way of draining a channel in a nonblocking way,
+			// consider instead signalling cancellation of the services with a
+			// context, letting them close the channel, and using a waitgroup to
+			// wait for them to exit.
+			// See: https://github.com/hermeticbuild/rules_itest/issues/72
 		Drain:
 			for {
 				select {
