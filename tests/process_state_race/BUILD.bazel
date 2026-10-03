@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "process_state_race_test",
+    srcs = ["process_state_race_test.go"],
+    gc_linkopts = [
+        "-extldflags",
+        "-no-pie",
+    ],
+    pure = "off",
+    race = "on",
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = ["@rules_itest//runner"],
+)
