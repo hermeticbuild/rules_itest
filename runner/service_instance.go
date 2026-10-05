@@ -238,9 +238,11 @@ func (s *ServiceInstance) StopWithSignal(signal syscall.Signal) error {
 		return nil
 	}
 
-	err := killGroup(s.cmd, signal)
-	if isGone(err) {
-		return nil
+	if err := killGroup(s.cmd, signal); err != nil {
+		if isGone(err) {
+			return nil
+		}
+		return err
 	}
 
 	func() {
