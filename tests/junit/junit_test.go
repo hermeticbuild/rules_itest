@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -34,6 +35,11 @@ func markReady(path string) {
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		mode := os.Args[1]
+		if path := os.Getenv("JUNIT_SOCKET_DIR_RECORD"); path != "" {
+			if err := os.WriteFile(path, []byte(os.Getenv("SOCKET_DIR")), 0600); err != nil {
+				panic(err)
+			}
+		}
 		switch mode {
 		case "--junit-helper-health":
 			if _, err := os.Stat(os.Args[2]); err != nil {
@@ -93,10 +99,10 @@ func TestMain(m *testing.M) {
 			markReady(os.Args[2])
 			time.Sleep(30 * time.Second)
 			os.Exit(0)
-		case "--junit-helper-audit-capture", "--junit-helper-pass", "--junit-helper-child-xml", "--junit-helper-fail", "--junit-helper-misleading-fail":
+		case "--junit-helper-unlink-capture", "--junit-helper-audit-capture", "--junit-helper-pass", "--junit-helper-child-xml", "--junit-helper-fail", "--junit-helper-misleading-fail":
 			fmt.Println("child stdout <&>")
 			fmt.Fprintln(os.Stderr, "child stderr")
-			if mode == "--junit-helper-audit-capture" {
+			if mode == "--junit-helper-audit-capture" || mode == "--junit-helper-unlink-capture" {
 				entries, err := os.ReadDir(os.Getenv("TEST_TMPDIR"))
 				if err != nil {
 					panic(err)
@@ -105,13 +111,19 @@ func TestMain(m *testing.M) {
 				for _, entry := range entries {
 					if strings.HasPrefix(entry.Name(), ".svcinit-output-") {
 						found = true
+						if mode == "--junit-helper-unlink-capture" {
+							if err := os.Remove(filepath.Join(os.Getenv("TEST_TMPDIR"), entry.Name())); err != nil {
+								panic(err)
+							}
+							fmt.Println("output after capture file removal")
+						}
 					}
 				}
 				if !found {
 					panic("capture file is not in TEST_TMPDIR")
 				}
 			}
-			if mode != "--junit-helper-pass" && mode != "--junit-helper-audit-capture" {
+			if mode != "--junit-helper-pass" && mode != "--junit-helper-audit-capture" && mode != "--junit-helper-unlink-capture" {
 				xml := `<testsuite name="child" tests="2" failures="0"><testcase name="child-a"/><testcase name="child-b"/></testsuite>`
 				if mode == "--junit-helper-fail" {
 					// Exercise nested suites, declarations, and detailed failures.
@@ -183,6 +195,7 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 	}{
 		{name: "success", child: "pass", tests: 1},
 		{name: "capture_in_test_tmpdir", child: "audit-capture", tests: 1},
+		{name: "capture_file_removed", child: "unlink-capture", tests: 1},
 		{name: "capture_unavailable", child: "pass", tests: 1, badCaptureDir: true},
 		{name: "leaked_descendant_after_pass", child: "pipe-parent", tests: 1},
 		{name: "child_report", child: "child-xml", tests: 2},
@@ -200,6 +213,9 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 		{name: "second_interrupt", child: "leaked-pipe-test", failure: "Interrupted by", trigger: "second-interrupt", tests: 1},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
+			if scenario.child == "unlink-capture" && runtime.GOOS == "windows" {
+				t.Skip("Windows does not allow unlinking this open file")
+			}
 			temporary := t.TempDir()
 			xmlPath := filepath.Join(temporary, "reports", "test.xml")
 			if err := os.Mkdir(filepath.Dir(xmlPath), 0700); err != nil {
@@ -248,6 +264,7 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 			// Bound pipe reads even if a surviving descendant holds stdout open.
 			cmd.WaitDelay = time.Second
 			cmd.Env = append(os.Environ(),
+				"JUNIT_SOCKET_DIR_RECORD="+filepath.Join(temporary, "socket-dir"),
 				"TEST_TARGET=//fixture:"+scenario.name,
 				"TEST_TMPDIR="+temporary,
 				"XML_OUTPUT_FILE="+xmlPath,
@@ -317,6 +334,15 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 			if (runErr != nil) != (scenario.failure != "") {
 				t.Fatalf("unexpected runner result %v: %s", runErr, output.String())
 			}
+			if scenario.trigger == "interrupt" || scenario.trigger == "startup-interrupt" {
+				socketDir, err := os.ReadFile(filepath.Join(temporary, "socket-dir"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(string(socketDir)); !os.IsNotExist(err) {
+					t.Fatalf("interrupted run left its socket directory behind: %s", socketDir)
+				}
+			}
 			if scenario.noXML {
 				if !strings.Contains(output.String(), "Shutdown requested") {
 					t.Fatalf("XML-disabled run did not handle the requested interruption: %s", output.String())
@@ -370,6 +396,9 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 				if scenario.service == "service" && (!strings.Contains(final.SystemOut, "service stdout <&>") || !strings.Contains(final.SystemOut, "Stopping")) {
 					t.Fatalf("service output or shutdown diagnostics were lost: %s", contents)
 				}
+			}
+			if scenario.child == "unlink-capture" && !strings.Contains(final.SystemOut, "output after capture file removal") {
+				t.Fatal("removing the capture pathname lost output or changed the test result")
 			}
 			if scenario.badCaptureDir && !strings.Contains(final.SystemOut, "Unable to capture") {
 				t.Fatalf("capture setup failure was not reported: %s", contents)

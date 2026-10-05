@@ -48,6 +48,14 @@ var (
 var getAssignedPortRlocationPath string
 
 func main() {
+	// Run normal cleanup before returning an unsuccessful interrupted result,
+	// including when XML reporting is disabled.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
 	start := time.Now()
 	junit := newJUnitReporter(start)
 	defer junit.finishOnReturn()
@@ -194,7 +202,7 @@ func main() {
 		mustStopAllForExit()
 		if errors.Is(err, context.Canceled) {
 			if isOneShot {
-				junit.exitFailure("Service startup canceled before completion")
+				exitCode = 1
 			}
 			return
 		}
@@ -292,7 +300,7 @@ func main() {
 			mustStopAllForExit()
 			log.Println("Cleaning up.")
 			if isOneShot {
-				junit.exitFailure("Test execution canceled before completion")
+				exitCode = 1
 			}
 			return
 		case ibazelCmd := <-interactiveCh:

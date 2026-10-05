@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/xml"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // The service runner owns the final result, including startup and shutdown.
@@ -117,19 +119,18 @@ func (r *junitReporter) finish(exitCode int, message string) error {
 			exitCode = 1
 		}
 		r.mu.Unlock()
-		output, err := r.capture.finish()
+		output, captureErr := r.capture.finish()
+		defer output.Close()
+		var diagnostics string
 		if r.captureWarning != "" {
-			output += "\n" + r.captureWarning
+			diagnostics += "\n" + r.captureWarning
 		}
-		if err != nil {
-			exitCode = 1
-			message += fmt.Sprintf("\nCapturing test output: %v", err)
+		if captureErr != nil {
+			diagnostics += fmt.Sprintf("\nCapturing test output: %v\n", captureErr)
 		}
 		r.exitCode = exitCode
-		r.err = writeJUnitReport(r.path, r.target, time.Since(r.start), exitCode, message, output)
-		if r.err == nil {
-			r.err = err
-		}
+		r.err = writeJUnitReportWithOutput(r.path, r.target, time.Since(r.start), exitCode, message,
+			io.MultiReader(output, strings.NewReader(diagnostics)))
 	})
 	return r.err
 }
@@ -141,7 +142,7 @@ type junitSuite struct {
 	Failures  int       `xml:"failures,attr"`
 	Time      string    `xml:"time,attr"`
 	Case      junitCase `xml:"testcase"`
-	SystemOut string    `xml:"system-out"`
+	SystemOut string    `xml:"system-out,omitempty"`
 }
 
 type junitCase struct {
@@ -213,7 +214,13 @@ func childJUnitSuites(data []byte) (string, []xml.Attr, error) {
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 func writeJUnitReport(path, target string, duration time.Duration, exitCode int, message, output string) error {
-	child, err := os.ReadFile(path)
+	return writeJUnitReportWithOutput(path, target, duration, exitCode, message, strings.NewReader(output))
+}
+
+func writeJUnitReportWithOutput(path, target string, duration time.Duration, exitCode int, message string, output io.Reader) error {
+	// A successful child owns its report. Avoid reading either its XML or
+	// the runner log when no replacement is needed.
+	_, err := os.Stat(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -226,18 +233,19 @@ func writeJUnitReport(path, target string, duration time.Duration, exitCode int,
 	var suites string
 	var namespaces []xml.Attr
 	if err == nil {
+		child, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
 		suites, namespaces, err = childJUnitSuites(child)
 		if err != nil {
-			// Invalid child XML must not mask the runner's failure. Keep its
-			// contents available as diagnostics in the replacement report.
-			output += fmt.Sprintf("\nInvalid child JUnit report (%v):\n%s", err, child)
+			output = io.MultiReader(output, strings.NewReader(fmt.Sprintf("\nInvalid child JUnit report (%v):\n%s", err, child)))
 		}
 	}
 	elapsed := fmt.Sprintf("%.6f", duration.Seconds())
 	report := junitSuite{
 		Name: target, Tests: 1, Time: elapsed,
-		Case:      junitCase{Name: target, Time: elapsed},
-		SystemOut: ansiEscape.ReplaceAllString(output, ""),
+		Case: junitCase{Name: target, Time: elapsed},
 	}
 	if exitCode != 0 {
 		report.Failures = 1
@@ -250,17 +258,6 @@ func writeJUnitReport(path, target string, duration time.Duration, exitCode int,
 	if err != nil {
 		return err
 	}
-	if suites != "" {
-		var wrapper bytes.Buffer
-		encoder := xml.NewEncoder(&wrapper)
-		if err := encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: "testsuites"}, Attr: namespaces}); err != nil {
-			return err
-		}
-		if err := encoder.Flush(); err != nil {
-			return err
-		}
-		encoded = []byte(wrapper.String() + "\n" + suites + "\n" + string(encoded) + "\n</testsuites>")
-	}
 	file, err := os.CreateTemp(filepath.Dir(path), ".svcinit-junit-*")
 	if err != nil {
 		return err
@@ -270,16 +267,111 @@ func writeJUnitReport(path, target string, duration time.Duration, exitCode int,
 	if err := file.Chmod(0644); err != nil {
 		return err
 	}
-	if _, err := file.WriteString(xml.Header); err != nil {
+	writer := bufio.NewWriter(file)
+	if _, err := writer.WriteString(xml.Header); err != nil {
 		return err
 	}
-	if _, err := file.Write(encoded); err != nil {
+	if suites != "" {
+		encoder := xml.NewEncoder(writer)
+		if err := encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: "testsuites"}, Attr: namespaces}); err != nil {
+			return err
+		}
+		if err := encoder.Flush(); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(writer, "\n%s\n", suites); err != nil {
+			return err
+		}
+	}
+	if _, err := writer.Write(bytes.TrimSuffix(encoded, []byte("</testsuite>"))); err != nil {
+		return err
+	}
+	if _, err := writer.WriteString("\n  <system-out>"); err != nil {
+		return err
+	}
+	if err := streamJUnitOutput(writer, output); err != nil {
+		return err
+	}
+	if _, err := writer.WriteString("</system-out>\n</testsuite>"); err != nil {
+		return err
+	}
+	if suites != "" {
+		if _, err := writer.WriteString("\n</testsuites>"); err != nil {
+			return err
+		}
+	}
+	if err := writer.Flush(); err != nil {
 		return err
 	}
 	if err := file.Close(); err != nil {
 		return err
 	}
 	return os.Rename(file.Name(), path)
+}
+
+// Escape logs incrementally, preserving UTF-8 and ANSI sequences even when
+// their bytes span reads. Bound incomplete escape sequences as well as logs.
+func streamJUnitOutput(writer io.Writer, output io.Reader) error {
+	reader := bufio.NewReader(output)
+	buffer := make([]byte, 0, 32*1024)
+	var escape []byte
+	state := 0
+	flush := func() error {
+		err := xml.EscapeText(writer, buffer)
+		buffer = buffer[:0]
+		return err
+	}
+	for {
+		r, _, err := reader.ReadRune()
+		if err != nil {
+			buffer = append(buffer, escape...)
+			if err != io.EOF {
+				buffer = append(buffer, fmt.Sprintf("\nReading captured test output: %v\n", err)...)
+			}
+			return flush()
+		}
+		if state != 0 {
+			switch {
+			case state == 1 && r == '[':
+				state = 2
+			case state == 2 && r >= '0' && r <= '?':
+			case (state == 2 || state == 3) && r >= ' ' && r <= '/':
+				state = 3
+			case (state == 2 || state == 3) && r >= '@' && r <= '~':
+				escape = escape[:0]
+				state = 0
+				continue
+			default:
+				buffer = append(buffer, escape...)
+				escape = escape[:0]
+				state = 0
+			}
+			if state != 0 {
+				escape = utf8.AppendRune(escape, r)
+				if len(escape) <= 1024 {
+					continue
+				}
+				buffer = append(buffer, escape...)
+				escape = escape[:0]
+				state = 0
+				if err := flush(); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if r == '\x1b' {
+			escape = append(escape[:0], '\x1b')
+			state = 1
+		} else {
+			buffer = utf8.AppendRune(buffer, r)
+		}
+		if len(buffer) >= 32*1024 {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // Capture runner and descendant output while still streaming it to Bazel.
@@ -318,14 +410,26 @@ func (r *junitReporter) captureOutput() error {
 	return nil
 }
 
-func (c *junitOutput) finish() (string, error) {
+// Keep the file open until the report is written: a child may unlink the
+// temporary log, and reading by its old pathname would lose captured output.
+type junitCapturedOutput struct {
+	io.Reader
+	file *os.File
+}
+
+func (o *junitCapturedOutput) Close() error {
+	defer os.Remove(o.file.Name())
+	return o.file.Close()
+}
+
+func (c *junitOutput) finish() (io.ReadCloser, error) {
 	if c == nil {
-		return "", nil
+		return io.NopCloser(strings.NewReader("")), nil
 	}
 	log.SetOutput(c.stderr)
 	c.writer.Close()
-	// A forcibly terminated runner can still have descendants holding the
-	// pipe open. Bound draining so writing the failure report cannot hang.
+	// Descendants can retain the pipe after the test exits. Bound draining,
+	// then read a fixed snapshot without changing the capture writer's offset.
 	var captureErr error
 	var warning string
 	select {
@@ -336,13 +440,16 @@ func (c *junitOutput) finish() (string, error) {
 	}
 	c.reader.Close()
 	captureErr = errors.Join(captureErr, c.output.failure())
-	c.file.Close()
-	defer os.Remove(c.file.Name())
-	data, err := os.ReadFile(c.file.Name())
+	info, err := c.file.Stat()
 	if err != nil {
-		return "", err
+		c.file.Close()
+		os.Remove(c.file.Name())
+		return io.NopCloser(strings.NewReader(warning)), errors.Join(captureErr, err)
 	}
-	return string(data) + warning, captureErr
+	return &junitCapturedOutput{
+		Reader: io.MultiReader(io.NewSectionReader(c.file, 0, info.Size()), strings.NewReader(warning)),
+		file:   c.file,
+	}, captureErr
 }
 
 // A broken log destination must not stop draining the child output pipe.
