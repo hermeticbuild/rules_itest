@@ -3,13 +3,11 @@
 package runner
 
 import (
-	"fmt"
 	"os/exec"
 	"syscall"
 )
 
 func errnoMeansProcessGone(errno syscall.Errno) bool {
-	fmt.Println("ERRNO", errno)
 	switch errno {
 	case syscall.ESRCH:
 		return true
