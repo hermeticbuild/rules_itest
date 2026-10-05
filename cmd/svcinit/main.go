@@ -51,6 +51,7 @@ func main() {
 	start := time.Now()
 	junit := newJUnitReporter(start)
 	defer junit.finishOnReturn()
+	must(junit.captureOutput())
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -171,8 +172,9 @@ func main() {
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		count := 0
-		for range signalCh {
+		for sig := range signalCh {
 			if count == 0 {
+				junit.recordFailure(fmt.Sprintf("Interrupted by %s", sig))
 				log.Println("Shutdown requested, exiting gracefully. Press Ctrl-C again to force exit")
 				cancelFunc()
 				count++
@@ -185,6 +187,7 @@ func main() {
 
 	criticalPath, err := r.StartAll(servicesErrCh)
 	if err != nil {
+		junit.recordFailure(fmt.Sprintf("Service startup failed: %v", err))
 		mustStopAllForExit()
 		if errors.Is(err, context.Canceled) {
 			return
@@ -278,6 +281,7 @@ func main() {
 
 		select {
 		case <-ctx.Done():
+			junit.recordFailure("Test execution canceled before completion")
 			log.Println("Shutting down services.")
 			mustStopAllForExit()
 			log.Println("Cleaning up.")
@@ -318,6 +322,7 @@ func main() {
 			if testErr != nil {
 				log.Printf("Encountered error during test run: %s\n", testErr)
 				if isOneShot {
+					junit.recordFailure(fmt.Sprintf("Test failed: %v", testErr))
 					mustStopAllForExit()
 					junit.exitFailure(fmt.Sprint(testErr))
 				}
@@ -325,6 +330,7 @@ func main() {
 		case serviceErr := <-servicesErrCh:
 			log.Print(serviceErr)
 			if isOneShot {
+				junit.recordFailure(fmt.Sprintf("Service failed: %v", serviceErr))
 				mustStopAllForExit()
 				junit.exitFailure("Service exited uncleanly, marking test as failed.")
 			}
@@ -357,6 +363,7 @@ func main() {
 		must(err)
 
 		if isOneShot {
+			junit.markSuccess()
 			break
 		}
 	}
