@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,16 +19,17 @@ import (
 
 // The service runner owns the final result, including startup and shutdown.
 type junitReporter struct {
-	path     string
-	target   string
-	start    time.Time
-	once     sync.Once
-	err      error
-	exitCode int
-	capture  *junitOutput
-	mu       sync.Mutex
-	success  bool
-	causes   []string
+	path           string
+	target         string
+	start          time.Time
+	once           sync.Once
+	err            error
+	exitCode       int
+	capture        *junitOutput
+	mu             sync.Mutex
+	success        bool
+	causes         []string
+	captureWarning string
 }
 
 func newJUnitReporter(start time.Time) *junitReporter {
@@ -116,6 +118,9 @@ func (r *junitReporter) finish(exitCode int, message string) error {
 		}
 		r.mu.Unlock()
 		output, err := r.capture.finish()
+		if r.captureWarning != "" {
+			output += "\n" + r.captureWarning
+		}
 		if err != nil {
 			exitCode = 1
 			message += fmt.Sprintf("\nCapturing test output: %v", err)
@@ -152,32 +157,45 @@ type junitFailure struct {
 
 // Retain the child's suites verbatim, including case details and extensions.
 // Strip only an outer testsuites wrapper and the XML declaration for merging.
-func childJUnitSuites(data []byte) (string, error) {
+func childJUnitSuites(data []byte) (string, []xml.Attr, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	var suites string
+	var namespaces []xml.Attr
 	found := false
 	for {
 		offset := decoder.InputOffset()
 		token, err := decoder.Token()
 		if err == io.EOF {
 			if !found {
-				return "", fmt.Errorf("missing JUnit suite")
+				return "", nil, fmt.Errorf("missing JUnit suite")
 			}
-			return suites, nil
+			return suites, namespaces, nil
 		}
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		switch token := token.(type) {
 		case xml.StartElement:
-			if found || token.Name.Space != "" || (token.Name.Local != "testsuite" && token.Name.Local != "testsuites") {
-				return "", fmt.Errorf("unexpected JUnit root %s", token.Name.Local)
+			if found || (token.Name.Local != "testsuite" && token.Name.Local != "testsuites") {
+				return "", nil, fmt.Errorf("unexpected JUnit root %s", token.Name.Local)
+			}
+			for _, attr := range token.Attr {
+				switch {
+				case attr.Name.Space == "xmlns":
+					attr.Name = xml.Name{Local: "xmlns:" + attr.Name.Local}
+				case attr.Name.Space == "" && attr.Name.Local == "xmlns":
+				case attr.Name.Space == "http://www.w3.org/XML/1998/namespace":
+					attr.Name = xml.Name{Local: "xml:" + attr.Name.Local}
+				default:
+					continue
+				}
+				namespaces = append(namespaces, attr)
 			}
 			var root struct {
 				Inner string `xml:",innerxml"`
 			}
 			if err := decoder.DecodeElement(&root, &token); err != nil {
-				return "", err
+				return "", nil, err
 			}
 			suites = root.Inner
 			if token.Name.Local == "testsuite" {
@@ -186,7 +204,7 @@ func childJUnitSuites(data []byte) (string, error) {
 			found = true
 		case xml.CharData:
 			if strings.TrimSpace(string(token)) != "" {
-				return "", fmt.Errorf("text outside JUnit suite")
+				return "", nil, fmt.Errorf("text outside JUnit suite")
 			}
 		}
 	}
@@ -200,11 +218,15 @@ func writeJUnitReport(path, target string, duration time.Duration, exitCode int,
 		return err
 	}
 	if err == nil && exitCode == 0 {
-		return os.Chmod(path, 0644)
+		if err := os.Chmod(path, 0644); err != nil {
+			log.Printf("Setting child JUnit report permissions: %v", err)
+		}
+		return nil
 	}
 	var suites string
+	var namespaces []xml.Attr
 	if err == nil {
-		suites, err = childJUnitSuites(child)
+		suites, namespaces, err = childJUnitSuites(child)
 		if err != nil {
 			// Invalid child XML must not mask the runner's failure. Keep its
 			// contents available as diagnostics in the replacement report.
@@ -229,7 +251,15 @@ func writeJUnitReport(path, target string, duration time.Duration, exitCode int,
 		return err
 	}
 	if suites != "" {
-		encoded = []byte("<testsuites>\n" + suites + "\n" + string(encoded) + "\n</testsuites>")
+		var wrapper bytes.Buffer
+		encoder := xml.NewEncoder(&wrapper)
+		if err := encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: "testsuites"}, Attr: namespaces}); err != nil {
+			return err
+		}
+		if err := encoder.Flush(); err != nil {
+			return err
+		}
+		encoded = []byte(wrapper.String() + "\n" + suites + "\n" + string(encoded) + "\n</testsuites>")
 	}
 	file, err := os.CreateTemp(filepath.Dir(path), ".svcinit-junit-*")
 	if err != nil {
@@ -259,13 +289,14 @@ type junitOutput struct {
 	reader, writer *os.File
 	file           *os.File
 	done           chan error
+	output         *junitOutputWriter
 }
 
 func (r *junitReporter) captureOutput() error {
 	if r == nil {
 		return nil
 	}
-	file, err := os.CreateTemp(filepath.Dir(r.path), ".svcinit-output-*")
+	file, err := os.CreateTemp(os.Getenv("TEST_TMPDIR"), ".svcinit-output-*")
 	if err != nil {
 		return err
 	}
@@ -276,11 +307,12 @@ func (r *junitReporter) captureOutput() error {
 		return err
 	}
 	capture := &junitOutput{stdout: os.Stdout, stderr: os.Stderr, reader: reader, writer: writer, file: file, done: make(chan error, 1)}
+	capture.output = &junitOutputWriter{file: file, stdout: capture.stdout}
 	r.capture = capture
 	os.Stdout, os.Stderr = writer, writer
 	log.SetOutput(writer)
 	go func() {
-		_, err := io.Copy(io.MultiWriter(file, capture.stdout), reader)
+		_, err := io.Copy(capture.output, reader)
 		capture.done <- err
 	}()
 	return nil
@@ -290,24 +322,64 @@ func (c *junitOutput) finish() (string, error) {
 	if c == nil {
 		return "", nil
 	}
-	os.Stdout, os.Stderr = c.stdout, c.stderr
 	log.SetOutput(c.stderr)
 	c.writer.Close()
 	// A forcibly terminated runner can still have descendants holding the
 	// pipe open. Bound draining so writing the failure report cannot hang.
 	var captureErr error
+	var warning string
 	select {
 	case captureErr = <-c.done:
 	case <-time.After(time.Second):
 		c.reader.Close()
-		captureErr = fmt.Errorf("output pipe remained open after runner completion")
+		warning = "\nOutput capture stopped after the drain deadline; a descendant may still hold the output pipe open.\n"
 	}
 	c.reader.Close()
+	captureErr = errors.Join(captureErr, c.output.failure())
 	c.file.Close()
 	defer os.Remove(c.file.Name())
 	data, err := os.ReadFile(c.file.Name())
 	if err != nil {
 		return "", err
 	}
-	return string(data), captureErr
+	return string(data) + warning, captureErr
+}
+
+// A broken log destination must not stop draining the child output pipe.
+// Disable that destination, retain its error, and keep forwarding to the other.
+type junitOutputWriter struct {
+	file, stdout io.Writer
+	mu           sync.Mutex
+	err          error
+}
+
+func (w *junitOutputWriter) Write(data []byte) (int, error) {
+	for _, destination := range []struct {
+		name   string
+		writer *io.Writer
+	}{
+		{name: "capture file", writer: &w.file},
+		{name: "test output", writer: &w.stdout},
+	} {
+		if *destination.writer == nil {
+			continue
+		}
+		n, err := (*destination.writer).Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			w.mu.Lock()
+			w.err = errors.Join(w.err, fmt.Errorf("writing %s: %w", destination.name, err))
+			w.mu.Unlock()
+			*destination.writer = nil
+		}
+	}
+	return len(data), nil
+}
+
+func (w *junitOutputWriter) failure() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
 }

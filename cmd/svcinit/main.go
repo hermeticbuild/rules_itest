@@ -51,7 +51,10 @@ func main() {
 	start := time.Now()
 	junit := newJUnitReporter(start)
 	defer junit.finishOnReturn()
-	must(junit.captureOutput())
+	if err := junit.captureOutput(); err != nil {
+		junit.captureWarning = fmt.Sprintf("Unable to capture service-test output: %v", err)
+		log.Print(junit.captureWarning)
+	}
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -190,6 +193,9 @@ func main() {
 		junit.recordFailure(fmt.Sprintf("Service startup failed: %v", err))
 		mustStopAllForExit()
 		if errors.Is(err, context.Canceled) {
+			if isOneShot {
+				junit.exitFailure("Service startup canceled before completion")
+			}
 			return
 		}
 	}
@@ -285,6 +291,9 @@ func main() {
 			log.Println("Shutting down services.")
 			mustStopAllForExit()
 			log.Println("Cleaning up.")
+			if isOneShot {
+				junit.exitFailure("Test execution canceled before completion")
+			}
 			return
 		case ibazelCmd := <-interactiveCh:
 			log.Println(ibazelCmd)
@@ -324,7 +333,7 @@ func main() {
 				if isOneShot {
 					junit.recordFailure(fmt.Sprintf("Test failed: %v", testErr))
 					mustStopAllForExit()
-					junit.exitFailure(fmt.Sprint(testErr))
+					junit.exitFailure(fmt.Sprintf("Test failed: %v", testErr))
 				}
 			}
 		case serviceErr := <-servicesErrCh:

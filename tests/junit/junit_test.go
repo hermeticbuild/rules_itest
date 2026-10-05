@@ -66,6 +66,8 @@ func TestMain(m *testing.M) {
 			time.Sleep(30 * time.Second)
 			os.Exit(0)
 		case "--junit-helper-pipe-parent", "--junit-helper-leaked-pipe-test":
+			fmt.Println("child stdout <&>")
+			fmt.Fprintln(os.Stderr, "child stderr")
 			executable, err := os.Executable()
 			if err != nil {
 				panic(err)
@@ -91,10 +93,25 @@ func TestMain(m *testing.M) {
 			markReady(os.Args[2])
 			time.Sleep(30 * time.Second)
 			os.Exit(0)
-		case "--junit-helper-pass", "--junit-helper-child-xml", "--junit-helper-fail", "--junit-helper-misleading-fail":
+		case "--junit-helper-audit-capture", "--junit-helper-pass", "--junit-helper-child-xml", "--junit-helper-fail", "--junit-helper-misleading-fail":
 			fmt.Println("child stdout <&>")
 			fmt.Fprintln(os.Stderr, "child stderr")
-			if mode != "--junit-helper-pass" {
+			if mode == "--junit-helper-audit-capture" {
+				entries, err := os.ReadDir(os.Getenv("TEST_TMPDIR"))
+				if err != nil {
+					panic(err)
+				}
+				found := false
+				for _, entry := range entries {
+					if strings.HasPrefix(entry.Name(), ".svcinit-output-") {
+						found = true
+					}
+				}
+				if !found {
+					panic("capture file is not in TEST_TMPDIR")
+				}
+			}
+			if mode != "--junit-helper-pass" && mode != "--junit-helper-audit-capture" {
 				xml := `<testsuite name="child" tests="2" failures="0"><testcase name="child-a"/><testcase name="child-b"/></testsuite>`
 				if mode == "--junit-helper-fail" {
 					// Exercise nested suites, declarations, and detailed failures.
@@ -162,8 +179,12 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 	for _, scenario := range []struct {
 		name, child, service, failure, trigger string
 		tests                                  int
+		noXML, badCaptureDir                   bool
 	}{
 		{name: "success", child: "pass", tests: 1},
+		{name: "capture_in_test_tmpdir", child: "audit-capture", tests: 1},
+		{name: "capture_unavailable", child: "pass", tests: 1, badCaptureDir: true},
+		{name: "leaked_descendant_after_pass", child: "pipe-parent", tests: 1},
 		{name: "child_report", child: "child-xml", tests: 2},
 		{name: "child_failure", child: "fail", failure: "exit status 1", tests: 3},
 		{name: "child_failure_with_passing_report", child: "misleading-fail", failure: "exit status 1", tests: 3},
@@ -172,13 +193,18 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 		{name: "shutdown_failure_after_child_pass", child: "child-xml", service: "stubborn-service", failure: "did not handle SIGTERM", tests: 3},
 		{name: "child_and_shutdown_failure", child: "fail", service: "stubborn-service", failure: "did not handle SIGTERM", tests: 3},
 		{name: "interrupt_during_test", child: "blocking-test", failure: "Interrupted by", trigger: "interrupt", tests: 1},
+		{name: "interrupt_without_xml", child: "blocking-test", failure: "canceled", trigger: "interrupt", noXML: true},
 		{name: "interrupt_during_startup", child: "pass", service: "never-healthy-service", failure: "Interrupted by", trigger: "startup-interrupt", tests: 1},
+		{name: "startup_interrupt_without_xml", child: "pass", service: "never-healthy-service", failure: "canceled", trigger: "startup-interrupt", noXML: true},
 		{name: "service_crash_during_test", child: "blocking-test", service: "crashing-service", failure: "exited with error", trigger: "crash", tests: 1},
 		{name: "second_interrupt", child: "leaked-pipe-test", failure: "Interrupted by", trigger: "second-interrupt", tests: 1},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			temporary := t.TempDir()
-			xmlPath := filepath.Join(temporary, "test.xml")
+			xmlPath := filepath.Join(temporary, "reports", "test.xml")
+			if err := os.Mkdir(filepath.Dir(xmlPath), 0700); err != nil {
+				t.Fatal(err)
+			}
 			ready := filepath.Join(temporary, "ready")
 			stopped := filepath.Join(temporary, "stopped")
 			childReady := filepath.Join(temporary, "child-ready")
@@ -233,6 +259,12 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 				"SVCINIT_TEST_RLOCATION_PATH="+helper,
 				"SVCINIT_TEST_ENV_RLOCATION_PATH="+envPath,
 			)
+			if scenario.noXML {
+				cmd.Env = append(cmd.Env, "XML_OUTPUT_FILE=")
+			}
+			if scenario.badCaptureDir {
+				cmd.Env = append(cmd.Env, "TEST_TMPDIR="+filepath.Join(temporary, "unavailable"))
+			}
 			var output bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &output, &output
 			if err := cmd.Start(); err != nil {
@@ -285,6 +317,15 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 			if (runErr != nil) != (scenario.failure != "") {
 				t.Fatalf("unexpected runner result %v: %s", runErr, output.String())
 			}
+			if scenario.noXML {
+				if !strings.Contains(output.String(), "Shutdown requested") {
+					t.Fatalf("XML-disabled run did not handle the requested interruption: %s", output.String())
+				}
+				if _, err := os.Stat(xmlPath); !os.IsNotExist(err) {
+					t.Fatal("XML-disabled run unexpectedly wrote a report")
+				}
+				return
+			}
 			contents, err := os.ReadFile(xmlPath)
 			if err != nil {
 				t.Fatalf("runner did not emit XML: %v\n%s", err, output.String())
@@ -323,12 +364,18 @@ func TestServiceRunnerFinalJUnit(t *testing.T) {
 				if final.Case[0].Name != "//fixture:"+scenario.name+"_shard_2/3" {
 					t.Fatalf("shard identity was lost: %s", contents)
 				}
-				if scenario.trigger == "" && scenario.service != "missing" && (!strings.Contains(final.SystemOut, "child stdout <&>") || !strings.Contains(final.SystemOut, "child stderr")) {
+				if scenario.trigger == "" && scenario.service != "missing" && !scenario.badCaptureDir && (!strings.Contains(final.SystemOut, "child stdout <&>") || !strings.Contains(final.SystemOut, "child stderr")) {
 					t.Fatalf("child output was lost: %s", contents)
 				}
 				if scenario.service == "service" && (!strings.Contains(final.SystemOut, "service stdout <&>") || !strings.Contains(final.SystemOut, "Stopping")) {
 					t.Fatalf("service output or shutdown diagnostics were lost: %s", contents)
 				}
+			}
+			if scenario.badCaptureDir && !strings.Contains(final.SystemOut, "Unable to capture") {
+				t.Fatalf("capture setup failure was not reported: %s", contents)
+			}
+			if scenario.name == "leaked_descendant_after_pass" && !strings.Contains(final.SystemOut, "drain deadline") {
+				t.Fatalf("capture truncation was not reported: %s", contents)
 			}
 			if scenario.trigger == "second-interrupt" && !strings.Contains(output.String(), "Multiple Ctrl-C detected") {
 				t.Fatalf("forced-exit path was not exercised: %s", output.String())
