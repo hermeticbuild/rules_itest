@@ -165,6 +165,9 @@ func (s *ServiceInstance) HealthCheck(ctx context.Context, expectedStartDuration
 		}
 
 		cmd := exec.CommandContext(ctx, s.ServiceSpec.HealthCheck, s.HealthCheckArgs...)
+		// A descendant may inherit the health check's output pipes. Bound the
+		// post-exit wait so one attempt cannot block service startup indefinitely.
+		cmd.WaitDelay = 50 * time.Millisecond
 		if shouldSilence {
 			cmd.Stdout = io.Discard
 			cmd.Stderr = io.Discard
@@ -173,6 +176,9 @@ func (s *ServiceInstance) HealthCheck(ctx context.Context, expectedStartDuration
 			cmd.Stderr = logger.New(s.Label+"? ", s.Color, os.Stderr)
 		}
 		err = cmd.Run()
+		if errors.Is(err, exec.ErrWaitDelay) && ctx.Err() == nil && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			err = nil
+		}
 		if err != nil {
 			cmd.Stdout.Write([]byte(err.Error()))
 			isHealthy = false
