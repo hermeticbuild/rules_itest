@@ -19,6 +19,22 @@ query:enable-reload --@rules_itest//:enable_per_service_reload
 In addition, if the `hot_reloadable` attribute is set on an `itest_service`, the service manager will
 forward the ibazel hot-reload notification over stdin instead of restarting the service.
 
+When using `bazel run` on an executable `itest_service`, `itest_task`, or `itest_service_group`, you can
+delegate additional arguments and environment variables to executable `itest_*` targets in the dependency graph:
+
+```text
+bazel run //path/to:target -- \
+  --target_env //path/to:some_task EXTRA_ENV=value \
+  --target_arg //path/to:some_task --flag value --other-flag "two words" \
+  --target_env //path/to:service_alias EXTRA_ENV=value "OTHER_ENV=value with space" \
+  --target_arg //path/to:service_alias --other-flag
+```
+
+Each `--target_arg` section appends its remaining arguments to that target's configured `args` until the next
+`--target_arg`. `--target_env <target> KEY=VALUE` injects or overrides an environment variable for that executable
+target. Targets are typically passed as their full label. Package-relative labels, target names, and Bazel alias
+that appears in the graph are also accepted.
+
 # Reusable port reservations
 
 For each service with `so_reuseport_aware = True`, the service manager adds
@@ -186,4 +202,3 @@ All [common binary attributes](https://bazel.build/reference/be/common-definitio
 | <a id="service_test-port_aliases"></a>port_aliases |  Port aliases allow you to 're-export' another service's port as belonging to this service group. This can be used to create abstractions (such as an itest_service combined with an itest_task) but not leak their implementation through how client code accesses port names.   | <a href="https://bazel.build/rules/lib/dict">Dictionary: String -> String</a> | optional |  `{}`  |
 | <a id="service_test-services"></a>services |  Services/tasks that comprise this group. Can be `itest_service`, `itest_task`, or `itest_service_group`.   | <a href="https://bazel.build/concepts/labels">List of labels</a> | optional |  `[]`  |
 | <a id="service_test-test"></a>test |  The underlying test target to execute once the services have been brought up and healthchecked.   | <a href="https://bazel.build/concepts/labels">Label</a> | optional |  `None`  |
-

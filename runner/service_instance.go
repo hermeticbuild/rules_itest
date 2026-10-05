@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -160,7 +159,7 @@ func (s *ServiceInstance) HealthCheck(ctx context.Context, expectedStartDuration
 			if terseOutput {
 				log.Printf("CMD Healthchecking %s\n", coloredLabel)
 			} else {
-				log.Printf("CMD Healthchecking %s (pid %d) : %s %v\n", coloredLabel, s.Pid(), s.Colorize(s.HealthCheckLabel), strings.Join(s.HealthCheckArgs, " "))
+				log.Printf("CMD Healthchecking %s (pid %d) : %s %s\n", coloredLabel, s.Pid(), s.Colorize(s.HealthCheckLabel), formatCommandArgs(s.HealthCheckArgs))
 			}
 		}
 
