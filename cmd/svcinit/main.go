@@ -49,6 +49,8 @@ var getAssignedPortRlocationPath string
 
 func main() {
 	start := time.Now()
+	junit := newJUnitReporter(start)
+	defer junit.finishOnReturn()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -161,7 +163,7 @@ func main() {
 		defer listener.Close()
 		err := svcctl.Serve(ctx, listener, r, ports, servicesErrCh)
 		if err != nil {
-			log.Fatalf("svcctl.Serve: %v", err)
+			junit.exitFailure(fmt.Sprintf("svcctl.Serve: %v", err))
 		}
 	}()
 
@@ -176,7 +178,7 @@ func main() {
 				count++
 			} else {
 				log.Println("Multiple Ctrl-C detected, force-exiting")
-				os.Exit(1)
+				junit.exitFailure("Interrupted twice while shutting down")
 			}
 		}
 	}()
@@ -317,14 +319,14 @@ func main() {
 				log.Printf("Encountered error during test run: %s\n", testErr)
 				if isOneShot {
 					mustStopAllForExit()
-					os.Exit(1)
+					junit.exitFailure(fmt.Sprint(testErr))
 				}
 			}
 		case serviceErr := <-servicesErrCh:
 			log.Print(serviceErr)
 			if isOneShot {
 				mustStopAllForExit()
-				log.Fatal("Service exited uncleanly, marking test as failed.\n\n")
+				junit.exitFailure("Service exited uncleanly, marking test as failed.")
 			}
 		}
 
