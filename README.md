@@ -25,6 +25,12 @@ common:enable-reload --@rules_itest//:enable_per_service_reload
 
 `ibazel run --config enable-reload //path/to:target`
 
+# Test reports
+
+One-shot `service_test` runs emit JUnit XML after test execution and service shutdown. This lets Bazel collect the report in the original test action instead of scheduling a separate fallback XML-generation action.
+
+Detailed child reports are preserved when the runner succeeds. Startup, test, shutdown and interruption failures add a failing runner suite alongside any child suites, preserving individual child failures. Runner reports include captured test and service output, and identify each shard separately. Output capture uses `TEST_TMPDIR` and streams logs into XML with bounded memory. Capture errors and output-drain deadlines are recorded as diagnostics and do not change a completed test result. Service groups under `bazel run`, keep-services-up runs, and `ibazel` sessions do not emit one-shot reports; `bazel run` of a test target follows the same reporting behavior as a one-shot test.
+
 # Examples
 First-party service examples (Go and Node.js binaries): [tests folder](https://github.com/hermeticbuild/rules_itest/tree/master/tests).
 

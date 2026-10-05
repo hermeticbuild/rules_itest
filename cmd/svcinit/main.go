@@ -48,7 +48,21 @@ var (
 var getAssignedPortRlocationPath string
 
 func main() {
+	// Run normal cleanup before returning an unsuccessful interrupted result,
+	// including when XML reporting is disabled.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
 	start := time.Now()
+	junit := newJUnitReporter(start)
+	defer junit.finishOnReturn()
+	if err := junit.captureOutput(); err != nil {
+		junit.captureWarning = fmt.Sprintf("Unable to capture service-test output: %v", err)
+		log.Print(junit.captureWarning)
+	}
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -161,7 +175,7 @@ func main() {
 		defer listener.Close()
 		err := svcctl.Serve(ctx, listener, r, ports, servicesErrCh)
 		if err != nil {
-			log.Fatalf("svcctl.Serve: %v", err)
+			junit.exitFailure(fmt.Sprintf("svcctl.Serve: %v", err))
 		}
 	}()
 
@@ -169,22 +183,27 @@ func main() {
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		count := 0
-		for range signalCh {
+		for sig := range signalCh {
 			if count == 0 {
+				junit.recordFailure(fmt.Sprintf("Interrupted by %s", sig))
 				log.Println("Shutdown requested, exiting gracefully. Press Ctrl-C again to force exit")
 				cancelFunc()
 				count++
 			} else {
 				log.Println("Multiple Ctrl-C detected, force-exiting")
-				os.Exit(1)
+				junit.exitFailure("Interrupted twice while shutting down")
 			}
 		}
 	}()
 
 	criticalPath, err := r.StartAll(servicesErrCh)
 	if err != nil {
+		junit.recordFailure(fmt.Sprintf("Service startup failed: %v", err))
 		mustStopAllForExit()
 		if errors.Is(err, context.Canceled) {
+			if isOneShot {
+				exitCode = 1
+			}
 			return
 		}
 	}
@@ -276,9 +295,13 @@ func main() {
 
 		select {
 		case <-ctx.Done():
+			junit.recordFailure("Test execution canceled before completion")
 			log.Println("Shutting down services.")
 			mustStopAllForExit()
 			log.Println("Cleaning up.")
+			if isOneShot {
+				exitCode = 1
+			}
 			return
 		case ibazelCmd := <-interactiveCh:
 			log.Println(ibazelCmd)
@@ -316,15 +339,17 @@ func main() {
 			if testErr != nil {
 				log.Printf("Encountered error during test run: %s\n", testErr)
 				if isOneShot {
+					junit.recordFailure(fmt.Sprintf("Test failed: %v", testErr))
 					mustStopAllForExit()
-					os.Exit(1)
+					junit.exitFailure(fmt.Sprintf("Test failed: %v", testErr))
 				}
 			}
 		case serviceErr := <-servicesErrCh:
 			log.Print(serviceErr)
 			if isOneShot {
+				junit.recordFailure(fmt.Sprintf("Service failed: %v", serviceErr))
 				mustStopAllForExit()
-				log.Fatal("Service exited uncleanly, marking test as failed.\n\n")
+				junit.exitFailure("Service exited uncleanly, marking test as failed.")
 			}
 		}
 
@@ -355,6 +380,7 @@ func main() {
 		must(err)
 
 		if isOneShot {
+			junit.markSuccess()
 			break
 		}
 	}

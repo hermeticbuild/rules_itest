@@ -25,6 +25,9 @@ rm -f "${{cleanup_marker}}"
 
 {env}
 
+# The expected failing child must not write the outer test's XML report.
+unset XML_OUTPUT_FILE
+
 set +e
 "${{test_path}}" >"${{log_file}}" 2>&1
 status=$?

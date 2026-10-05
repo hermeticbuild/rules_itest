@@ -1,0 +1,394 @@
+package main
+
+import (
+	"bytes"
+	"encoding/xml"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func readJUnit(t *testing.T, path string) junitSuite {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		XMLName xml.Name
+		Suites  []junitSuite `xml:"testsuite"`
+	}
+	if err := xml.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	if root.XMLName.Local == "testsuites" {
+		return root.Suites[len(root.Suites)-1]
+	}
+	var report junitSuite
+	if err := xml.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	return report
+}
+
+func TestJUnitFinalResult(t *testing.T) {
+	for _, exitCode := range []int{0, 1} {
+		t.Run(string(rune('0'+exitCode)), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.xml")
+			target := "//service:unicode_日本_<&\""
+			message := "shutdown failed: <error> & \"details\""
+			if err := writeJUnitReport(path, target, 1250*time.Millisecond, exitCode, message, ""); err != nil {
+				t.Fatal(err)
+			}
+			report := readJUnit(t, path)
+			if report.Name != target || report.Case.Name != target || report.Tests != 1 || report.Failures != exitCode || report.Time != "1.250000" {
+				t.Fatalf("incorrect final report: %+v", report)
+			}
+			if exitCode == 1 && (report.Case.Failure == nil || report.Case.Failure.Text != message) {
+				t.Fatalf("failure details did not round trip: %+v", report.Case.Failure)
+			}
+			if exitCode == 0 && report.Case.Failure != nil {
+				t.Fatal("success report contains a failure")
+			}
+		})
+	}
+}
+
+func TestJUnitPreservesChildReportUntilRunnerFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	child := []byte("<testsuite tests=\"2\"><testcase name=\"child-a\"/><testcase name=\"child-b\"/></testsuite>")
+	if err := os.WriteFile(path, child, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJUnitReport(path, "//service:test", time.Second, 0, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(child) {
+		t.Fatal("successful runner replaced the detailed child report")
+	}
+	if err := writeJUnitReport(path, "//service:test", time.Second, 1, "shutdown failed after child passed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if report := readJUnit(t, path); report.Failures != 1 || report.Case.Failure == nil {
+		t.Fatalf("shutdown failure was masked by child XML: %+v", report)
+	}
+	merged, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(merged), string(child)) {
+		t.Fatal("runner failure lost the child cases")
+	}
+}
+
+func TestJUnitPanicWritesFailureAndPropagates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	reporter := &junitReporter{path: path, target: "//service:test", start: time.Now()}
+	func() {
+		defer func() {
+			if got := recover(); got != "startup or shutdown failed" {
+				t.Fatalf("runner panic was swallowed: %v", got)
+			}
+		}()
+		defer reporter.finishOnReturn()
+		panic("startup or shutdown failed")
+	}()
+	if report := readJUnit(t, path); report.Failures != 1 || !strings.Contains(report.Case.Failure.Text, "startup or shutdown failed") || !strings.Contains(report.Case.Failure.Text, "TestJUnitPanicWritesFailureAndPropagates") {
+		t.Fatalf("incorrect panic report: %+v", report)
+	}
+}
+
+func TestJUnitReporterIsOneShotOnly(t *testing.T) {
+	t.Setenv("TEST_TARGET", "//service:test")
+	t.Setenv("XML_OUTPUT_FILE", filepath.Join(t.TempDir(), "test.xml"))
+	t.Setenv("IBAZEL_NOTIFY_CHANGES", "")
+	t.Setenv("TEST_TOTAL_SHARDS", "")
+	t.Setenv("TEST_SHARD_INDEX", "")
+	if newJUnitReporter(time.Now()) == nil {
+		t.Fatal("one-shot service test needs XML")
+	}
+	t.Setenv("IBAZEL_NOTIFY_CHANGES", "y")
+	if newJUnitReporter(time.Now()) != nil {
+		t.Fatal("interactive reload should not emit one-shot XML")
+	}
+	t.Setenv("IBAZEL_NOTIFY_CHANGES", "")
+	t.Setenv("TEST_TARGET", "")
+	if newJUnitReporter(time.Now()) != nil {
+		t.Fatal("bazel run should not emit test XML")
+	}
+	t.Setenv("TEST_TARGET", "//service:test")
+	t.Setenv("XML_OUTPUT_FILE", "")
+	if newJUnitReporter(time.Now()) != nil {
+		t.Fatal("missing XML_OUTPUT_FILE should disable reporting")
+	}
+}
+
+func TestJUnitWriteErrorIsReturned(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "test.xml")
+	if err := writeJUnitReport(path, "//service:test", time.Second, 0, "", ""); err == nil {
+		t.Fatal("XML write failure was ignored")
+	}
+}
+
+func TestJUnitMergesDetailedFailures(t *testing.T) {
+	for _, child := range []string{
+		`<testsuite name="child" tests="2" failures="1"><testcase name="pass"/><testcase name="fail"><failure message="assertion">details &amp; more</failure></testcase></testsuite>`,
+		`<?xml version="1.0"?><testsuites tests="2" errors="1"><testsuite name="child" tests="2" errors="1"><testcase name="pass"/><testcase name="error"><error message="exception"><![CDATA[stack <&>]]></error></testcase><system-out>child log</system-out></testsuite></testsuites>`,
+	} {
+		path := filepath.Join(t.TempDir(), "test.xml")
+		if err := os.WriteFile(path, []byte(child), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJUnitReport(path, "//service:test", time.Second, 1, "test and shutdown failed", "runner log"); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		suites, _, err := childJUnitSuites([]byte(child))
+		if err != nil || !strings.Contains(string(data), suites) {
+			t.Fatalf("lost child details: %s", data)
+		}
+		if report := readJUnit(t, path); report.Failures != 1 || report.SystemOut != "runner log" {
+			t.Fatalf("missing runner failure or output: %+v", report)
+		}
+	}
+}
+
+func TestJUnitInvalidChildDoesNotMaskFailure(t *testing.T) {
+	for _, child := range []string{"", "<testsuite>", "<wrong/>", "<testsuite/><testsuite/>"} {
+		path := filepath.Join(t.TempDir(), "test.xml")
+		if err := os.WriteFile(path, []byte(child), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJUnitReport(path, "//service:test", time.Second, 1, "failed", ""); err != nil {
+			t.Fatal(err)
+		}
+		report := readJUnit(t, path)
+		if report.Failures != 1 || !strings.Contains(report.SystemOut, child) || !strings.Contains(report.SystemOut, "Invalid child JUnit report") {
+			t.Fatalf("invalid child hid the failure or was discarded: %+v", report)
+		}
+	}
+}
+
+func TestJUnitOutputAndPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	output := "stdout <&>\nstderr\n\x1b[31mservice output\x1b[0m"
+	if err := writeJUnitReport(path, "//service:test", time.Second, 1, "\x1b[31mfailed\x1b[0m", output); err != nil {
+		t.Fatal(err)
+	}
+	report := readJUnit(t, path)
+	if report.SystemOut != "stdout <&>\nstderr\nservice output" || report.Case.Failure.Text != "failed" {
+		t.Fatalf("output was not preserved or cleaned: %+v", report)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0644 {
+			t.Fatalf("report is not readable by output collectors: %v, %v", info, err)
+		}
+	}
+}
+
+func TestJUnitShardNames(t *testing.T) {
+	t.Setenv("TEST_TARGET", "//service:test")
+	t.Setenv("XML_OUTPUT_FILE", filepath.Join(t.TempDir(), "test.xml"))
+	t.Setenv("IBAZEL_NOTIFY_CHANGES", "")
+	t.Setenv("TEST_TOTAL_SHARDS", "3")
+	t.Setenv("TEST_SHARD_INDEX", "1")
+	if got := newJUnitReporter(time.Now()).target; got != "//service:test_shard_2/3" {
+		t.Fatalf("shards have no unique identity: %s", got)
+	}
+}
+
+func TestJUnitRetainsMultipleFailureCauses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	r := &junitReporter{path: path, target: "//service:test", start: time.Now()}
+	r.recordFailure("Test failed: exit status 1")
+	if err := r.finish(2, "shutdown failed"); err != nil {
+		t.Fatal(err)
+	}
+	message := readJUnit(t, path).Case.Failure.Text
+	if !strings.Contains(message, "exit status 1") || !strings.Contains(message, "shutdown failed") {
+		t.Fatalf("cleanup hid the original failure: %s", message)
+	}
+}
+
+type brokenJUnitOutput struct {
+	err error
+}
+
+func (w brokenJUnitOutput) Write([]byte) (int, error) { return 0, w.err }
+
+func TestJUnitOutputWriteErrorsKeepPipeDraining(t *testing.T) {
+	for _, brokenDestination := range []string{"capture file", "stdout"} {
+		t.Run(brokenDestination, func(t *testing.T) {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			defer writer.Close()
+			failure := errors.New("destination unavailable")
+			var forwarded bytes.Buffer
+			output := &junitOutputWriter{file: brokenJUnitOutput{failure}, stdout: &forwarded}
+			if brokenDestination == "stdout" {
+				output.file, output.stdout = &forwarded, brokenJUnitOutput{failure}
+			}
+			copied := make(chan error, 1)
+			go func() { _, err := io.Copy(output, reader); copied <- err }()
+			payload := strings.Repeat("child output\n", 1<<16)
+			written := make(chan error, 1)
+			go func() { _, err := writer.Write([]byte(payload)); writer.Close(); written <- err }()
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("write error stopped draining the child's output pipe")
+			}
+			if err := <-copied; err != nil {
+				t.Fatal(err)
+			}
+			if forwarded.String() != payload || !errors.Is(output.failure(), failure) {
+				t.Fatal("the working destination lost output or the write failure was forgotten")
+			}
+		})
+	}
+}
+
+func TestJUnitMergedChildRetainsNamespaceBindings(t *testing.T) {
+	for _, child := range []string{
+		`<testsuites xmlns:detail="urn:child:details" xml:lang="fr"><testsuite tests="1"><testcase name="child"><detail:metadata>diagnostic</detail:metadata></testcase></testsuite></testsuites>`,
+		`<testsuites xmlns="urn:child:details"><testsuite tests="1"><testcase name="child"><metadata>diagnostic</metadata></testcase></testsuite></testsuites>`,
+		`<detail:testsuite xmlns:detail="urn:child:details" tests="1"><detail:testcase name="child"><detail:metadata>diagnostic</detail:metadata></detail:testcase></detail:testsuite>`,
+	} {
+		path := filepath.Join(t.TempDir(), "test.xml")
+		if err := os.WriteFile(path, []byte(child), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJUnitReport(path, "//service:test", time.Second, 1, "runner failure", ""); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoder := xml.NewDecoder(bytes.NewReader(data))
+		found := false
+		for {
+			token, err := decoder.Token()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("invalid merged XML: %v\n%s", err, data)
+			}
+			if element, ok := token.(xml.StartElement); ok && element.Name.Local == "metadata" {
+				found = true
+				if element.Name.Space != "urn:child:details" {
+					t.Fatalf("child namespace binding was lost: %s", data)
+				}
+			}
+		}
+		if !found || !strings.Contains(string(data), "diagnostic") || readJUnit(t, path).Failures != 1 {
+			t.Fatalf("child details or runner failure were lost: %s", data)
+		}
+	}
+}
+
+type oneByteJUnitReader struct{ io.Reader }
+
+func (r oneByteJUnitReader) Read(p []byte) (int, error) { return r.Reader.Read(p[:1]) }
+
+type brokenJUnitReader struct{}
+
+func (brokenJUnitReader) Read([]byte) (int, error) { return 0, errors.New("capture unavailable") }
+
+func TestJUnitStreamingBoundariesAndReadErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	output := strings.Repeat("x", 32767) + "日本語 <&>\x1b[31mred\x1b[0m\n"
+	reader := io.MultiReader(oneByteJUnitReader{strings.NewReader(output)}, brokenJUnitReader{})
+	if err := writeJUnitReportWithOutput(path, "//service:test", time.Second, 0, "", reader); err != nil {
+		t.Fatal(err)
+	}
+	report := readJUnit(t, path)
+	if report.Failures != 0 || !strings.HasPrefix(report.SystemOut, strings.ReplaceAll(strings.ReplaceAll(output, "\x1b[31m", ""), "\x1b[0m", "")) || !strings.Contains(report.SystemOut, "capture unavailable") {
+		t.Fatal("streaming lost Unicode, escaping, output, or capture diagnostics")
+	}
+}
+
+type repeatedJUnitReader struct{}
+
+func (repeatedJUnitReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+func TestJUnitLargeOutputUsesBoundedMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	const size = 32 << 20
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := writeJUnitReportWithOutput(path, "//service:test", time.Second, 0, "", io.LimitReader(repeatedJUnitReader{}, size)); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("reporting a 32 MiB log allocated %d bytes", allocated)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < size {
+		t.Fatal("streaming truncated a large log")
+	}
+}
+
+func TestJUnitPassingChildReportDoesNotReadRunnerOutput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.xml")
+	child := `<testsuite tests="1"><testcase name="child"/></testsuite>`
+	if err := os.WriteFile(path, []byte(child), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJUnitReportWithOutput(path, "//service:test", time.Second, 0, "", brokenJUnitReader{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != child {
+		t.Fatal("runner output errors changed a successful child report")
+	}
+}
+
+func TestJUnitCaptureWriteErrorDoesNotFailPassingTest(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	capture := &junitOutput{file: file, reader: reader, writer: writer, stderr: os.Stderr, done: make(chan error, 1)}
+	capture.output = &junitOutputWriter{file: file, stdout: brokenJUnitOutput{errors.New("output destination unavailable")}}
+	go func() { _, err := io.Copy(capture.output, reader); capture.done <- err }()
+	if _, err := writer.Write([]byte("captured child output")); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "test.xml")
+	reporter := &junitReporter{path: path, target: "//service:test", start: time.Now(), capture: capture}
+	if err := reporter.finish(0, ""); err != nil {
+		t.Fatal(err)
+	}
+	report := readJUnit(t, path)
+	if reporter.exitCode != 0 || report.Failures != 0 || !strings.Contains(report.SystemOut, "captured child output") || !strings.Contains(report.SystemOut, "output destination unavailable") {
+		t.Fatal("capture error changed the test result or lost available output")
+	}
+}
