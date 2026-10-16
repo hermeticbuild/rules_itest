@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+# Include the runner unit checks in the existing tests/ CI workspace.
+test_suite(
+    name = "unit_tests",
+    tests = ["@rules_itest//cmd/svcinit:svcinit_test"],
+)
+
+go_test(
+    name = "integration_test",
+    srcs = ["junit_test.go"],
+    args = ["--svcinit=$(rlocationpath @rules_itest//cmd/svcinit)"],
+    data = ["@rules_itest//cmd/svcinit"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = ["@rules_go//go/runfiles"],
+)

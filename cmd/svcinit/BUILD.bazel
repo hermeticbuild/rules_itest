@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "svcinit_lib",
     srcs = [
+        "junit.go",
         "main.go",
         "reserve_reusable_port_unix.go",
         "reserve_reusable_port_windows.go",
@@ -60,7 +61,10 @@ go_library(
 
 go_test(
     name = "svcinit_test",
-    srcs = ["reserve_reusable_port_test.go"],
+    srcs = [
+        "junit_test.go",
+        "reserve_reusable_port_test.go",
+    ],
     embed = [":svcinit_lib"],
 )
 
