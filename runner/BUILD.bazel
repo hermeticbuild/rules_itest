@@ -20,7 +20,10 @@ go_library(
 
 go_test(
     name = "runner_test",
-    srcs = ["runner_test.go"],
+    srcs = [
+        "runner_test.go",
+        "service_instance_test.go",
+    ],
     embed = [":runner"],
     deps = ["//svclib"],
 )

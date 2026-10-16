@@ -66,7 +66,10 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 	if s.Type == "task" {
 		err := s.waitErrFn()
 		log.Printf("%s completed.\n", coloredLabel)
-		return err
+		if err != nil {
+			return fmt.Errorf("%s exited with error: %w", coloredLabel, err)
+		}
+		return nil
 	}
 
 	sleepDuration, err := time.ParseDuration(s.HealthCheckInterval)
@@ -83,19 +86,19 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 
 	for {
 		if err := s.Error(); err != nil {
-			return err
+			return fmt.Errorf("%s exited with error: %w", coloredLabel, err)
 		}
 
 		if s.isDone() {
-			state := s.cmd.ProcessState
-			if state != nil {
-				return fmt.Errorf("%s exited before becoming healthy: %s", coloredLabel, state.String())
+			// done is set before Wait() records runErr, so read the cached wait result directly.
+			if err := s.waitErrFn(); err != nil {
+				return fmt.Errorf("%s exited before becoming healthy: %w", coloredLabel, err)
 			}
-			return fmt.Errorf("%s exited before becoming healthy", coloredLabel)
+			return fmt.Errorf("%s exited before becoming healthy: %s", coloredLabel, s.cmd.ProcessState.String())
 		}
 
 		if err := ctx.Err(); err != nil {
-			return err
+			return fmt.Errorf("%s never became healthy: %w", coloredLabel, err)
 		}
 
 		if s.HealthCheck(ctx, expectedStartDuration) {
