@@ -405,6 +405,87 @@ forcing the services within the group to define a specific startup ordering with
 It can bring up multiple services with a single `bazel run` command, which is useful for creating dev environments.""",
 )
 
+def _itest_local_environment_impl(ctx):
+    services = _collect_services(ctx.attr.services)
+
+    # Build port overrides dict from label keys
+    port_overrides = {
+        str(target.label): value
+        for target, value in ctx.attr.port_assignments.items()
+    }
+
+    # Add a group entry for this local environment
+    group = struct(
+        type = "group",
+        label = str(ctx.label),
+        deps = [str(service.label) for service in ctx.attr.services],
+        port_aliases = {},
+    )
+    services[group.label] = group
+
+    service_specs_file = _create_svcinit_actions(ctx, services)
+
+    runfiles = ctx.runfiles([service_specs_file])
+    runfiles = runfiles.merge_all(_services_runfiles(ctx))
+
+    env = _run_environment(ctx, service_specs_file)
+    if port_overrides:
+        env["SVCINIT_PORT_OVERRIDES"] = json.encode(port_overrides)
+
+    return [
+        RunEnvironmentInfo(environment = env),
+        DefaultInfo(runfiles = runfiles),
+    ]
+
+_itest_local_environment_attrs = _svcinit_attrs | {
+    "port_assignments": attr.label_keyed_string_dict(
+        doc = """Explicit port assignments for services. Maps port labels to port values.
+
+The keys should be the fully-qualified labels of port flags (e.g., `//path/to:service.port` for the main port,
+or `//path/to:service.http_port` for a named port). The values are the port numbers to assign.
+
+Example:
+```
+itest_local_environment(
+    name = "local_env",
+    services = [":my_service"],
+    port_assignments = {
+        ":my_service.port": "8080",
+        ":my_service.grpc_port": "9090",
+    },
+)
+```""",
+    ),
+    "services": attr.label_list(
+        providers = [_ServiceGroupInfo],
+        doc = "Services/tasks to bring up. Can be `itest_service`, `itest_task`, or `itest_service_group`.",
+    ),
+}
+
+itest_local_environment = rule(
+    implementation = _itest_local_environment_impl,
+    attrs = _itest_local_environment_attrs,
+    executable = True,
+    doc = """A local environment is similar to an itest_service_group, but allows explicit port assignments.
+
+This provides a Starlark-based alternative to overriding ports via Bazel flags (e.g., `--//path:service.port=8080`).
+Use this when you want deterministic, pre-configured port assignments for local development.
+
+Example:
+```
+itest_local_environment(
+    name = "local_env",
+    services = [":api_service", ":db_service"],
+    port_assignments = {
+        ":api_service.port": "8080",
+        ":db_service.port": "5432",
+    },
+)
+```
+
+Run with `bazel run :local_env` to bring up the services with the specified ports.""",
+)
+
 def _create_svcinit_actions(ctx, services):
     ctx.actions.symlink(
         output = ctx.outputs.executable,
