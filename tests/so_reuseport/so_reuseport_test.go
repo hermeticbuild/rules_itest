@@ -11,7 +11,7 @@ import (
 func TestNo_SO_REUSEPORT(t *testing.T) {
 	portNames := []string{
 		"@@//so_reuseport:reuseport_service",
-		"@@//so_reuseport:reuseport_service:named_port1",
+		"@@//so_reuseport:reuseport_service.named_port1",
 	}
 
 	t.Logf("ASSIGNED_PORTS: %v", os.Getenv("ASSIGNED_PORTS"))

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"math"
 	"net"
 	"os"
@@ -125,9 +124,19 @@ func main() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(err)
 
-	ports, reservedPorts, err := assignPorts(unversionedSpecs)
+	portsMap, servicesMap, reservedPorts, err := assignPorts(unversionedSpecs)
 	must(err)
 	defer closeReservedPorts(reservedPorts)
+
+	// Expose the rich port/service maps. These are inherited by both the test binary and
+	// all child services since they spawn with os.Environ() as their base.
+	serializedPortsMap, err := portsMap.Marshal()
+	must(err)
+	os.Setenv("ITEST_PORTS_MAP", string(serializedPortsMap))
+
+	serializedServicesMap, err := servicesMap.Marshal()
+	must(err)
+	os.Setenv("ITEST_SERVICES_MAP", string(serializedServicesMap))
 
 	svcctlPort := listener.Addr().(*net.TCPAddr).Port
 	svcctlPortStr := strconv.Itoa(svcctlPort)
@@ -139,7 +148,7 @@ func main() {
 		defer os.Remove("/tmp/svcctl_port")
 	}
 
-	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, portsMap, svcctlPortStr)
 	must(err)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -159,7 +168,7 @@ func main() {
 
 	go func() {
 		defer listener.Close()
-		err := svcctl.Serve(ctx, listener, r, ports, servicesErrCh)
+		err := svcctl.Serve(ctx, listener, r, portsMap, servicesMap, servicesErrCh)
 		if err != nil {
 			log.Fatalf("svcctl.Serve: %v", err)
 		}
@@ -212,7 +221,7 @@ func main() {
 			// Bazel's args attribute converts $$ to $, so args arrive with
 			// single-$ placeholders (e.g. ${@@//:svc}) unlike env/spec files
 			// which preserve the literal $$ since they're read from JSON.
-			argReplacements := buildReplacements(ports, "${")
+			argReplacements := buildReplacements(portsMap, "${")
 			testArgs := make([]string, len(os.Args[1:]))
 			for i, arg := range os.Args[1:] {
 				testArgs[i] = replaceAll(arg, argReplacements)
@@ -220,7 +229,7 @@ func main() {
 			testPath, err := runfiles.Rlocation(os.Getenv("SVCINIT_TEST_RLOCATION_PATH"))
 			must(err)
 
-			testEnv, err := buildTestEnv(ports)
+			testEnv, err := buildTestEnv(portsMap)
 			must(err)
 
 			fmt.Println("")
@@ -287,7 +296,7 @@ func main() {
 			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
 			must(err)
 
-			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, portsMap, svcctlPortStr)
 			must(err)
 
 			testCancel()
@@ -376,32 +385,77 @@ func readServiceSpecs(
 func assignPorts(
 	serviceSpecs map[string]svclib.ServiceSpec,
 ) (
-	svclib.Ports, map[string][]io.Closer, error,
+	svclib.PortsMap, svclib.ServicesMap, map[string][]io.Closer, error,
 ) {
 	var toClose []io.Closer
 	reservedPorts := map[string][]io.Closer{}
-	ports := svclib.Ports{}
+	portsMap := svclib.PortsMap{}
+	servicesMap := svclib.ServicesMap{}
 
-	for label, spec := range serviceSpecs {
-		namedPorts := maps.Clone(spec.NamedPorts)
-		if spec.AutoassignPort {
-			namedPorts[""] = spec.Port
+	// Tracks which service bound each port target, so we can enforce that a port is only
+	// ever bound once.
+	boundBy := map[string]string{}
+
+	// register binds a resolved port under its target label and every alias, in the rich
+	// port/service maps. The legacy string->port view (ASSIGNED_PORTS, substitution,
+	// /v0/port) is derived from portsMap on demand.
+	register := func(serviceLabel, portName, hostname, portStr, target string, aliases []string) {
+		info := svclib.BindingInfo{
+			Origin:   net.JoinHostPort(hostname, portStr),
+			Hostname: hostname,
+			Port:     portStr,
 		}
 
-		// Note, this can cause collisions. So be careful!
-		// To avoid port collisions, set so_reuseport_aware on the service definition
-		// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
-		for portName, port := range namedPorts {
-			var reservedPort io.Closer
-			var err error
-			if spec.SoReuseportAware {
-				requestedPort, parseErr := strconv.Atoi(port)
-				if parseErr != nil || requestedPort < 0 || requestedPort > 65535 {
-					return nil, nil, fmt.Errorf("invalid port %q for %s", port, label)
+		keys := append([]string{target}, aliases...)
+		for _, key := range keys {
+			portsMap[key] = info
+		}
+		servicesMap.Set(serviceLabel, portName, info)
+	}
+
+	for label, spec := range serviceSpecs {
+		if len(spec.PortBindings) == 0 {
+			continue
+		}
+
+		hostname := spec.Hostname
+		if hostname == "" {
+			hostname = "127.0.0.1"
+		}
+
+		for _, binding := range spec.PortBindings {
+			if other, ok := boundBy[binding.Target]; ok && other != label {
+				return nil, nil, nil, fmt.Errorf(
+					"port %q is bound by multiple services: %q and %q. A port may only be bound once",
+					binding.Target, other, label,
+				)
+			}
+			boundBy[binding.Target] = label
+
+			// External services are not managed by us; their ports are reachable as-is at the FQDN.
+			if spec.Type == "external_service" {
+				if !terseOutput {
+					log.Printf("Registering external port %s for %s (%s)\n", binding.Value, binding.Target, hostname)
 				}
-				reservedPort, port, err = reserveReusablePort(requestedPort)
+				register(label, binding.Name, hostname, binding.Value, binding.Target, binding.Aliases)
+				continue
+			}
+
+			// Internal service: reserve the port so we can discover an autoassigned one and hold it.
+			// Note, this can cause collisions. So be careful!
+			// To avoid port collisions, set so_reuseport_aware on the service definition
+			// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
+			var reservedPort io.Closer
+			var portStr string
+			if spec.SoReuseportAware {
+				requestedPort, parseErr := strconv.Atoi(binding.Value)
+				if parseErr != nil || requestedPort < 0 || requestedPort > 65535 {
+					return nil, nil, nil, fmt.Errorf("invalid port %q for %s", binding.Value, label)
+				}
+				var err error
+				reservedPort, portStr, err = reserveReusablePort(requestedPort)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 			} else {
 				// We do a bit of a dance here to set SO_LINGER to 0. For details, see
@@ -422,42 +476,23 @@ func assignPorts(
 					},
 				}
 
-				listener, listenErr := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
-				if listenErr != nil {
-					return nil, nil, listenErr
+				listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+binding.Value)
+				if err != nil {
+					return nil, nil, nil, err
 				}
-				_, port, err = net.SplitHostPort(listener.Addr().String())
+				_, portStr, err = net.SplitHostPort(listener.Addr().String())
 				if err != nil {
 					listener.Close()
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				reservedPort = listener
 			}
 
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
-			}
-
 			if !terseOutput {
-				log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
+				log.Printf("Assigning port %s to %s\n", portStr, binding.Target)
 			}
 
-			ports.Set(qualifiedPortName, port)
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				if !terseOutput {
-					log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-				}
-
-				ports.Set(qualifiedPortName, port)
-			}
+			register(label, binding.Name, hostname, portStr, binding.Target, binding.Aliases)
 
 			if !spec.SoReuseportAware {
 				toClose = append(toClose, reservedPort)
@@ -468,30 +503,24 @@ func assignPorts(
 	}
 
 	for _, reservedPort := range toClose {
-		err := reservedPort.Close()
-		if err != nil {
-			return nil, nil, err
+		if err := reservedPort.Close(); err != nil {
+			return nil, nil, nil, err
 		}
 	}
 
+	// Resolve service-group port aliases (re-exports of another service's port).
 	for label, spec := range serviceSpecs {
 		for portName, aliasedTo := range spec.PortAliases {
-			qualifiedPortName := label
+			// Zero value if the aliased target has no rich info; Port will be "".
+			info := portsMap[aliasedTo]
+
+			qualifiedDot := label
 			if portName != "" {
-				qualifiedPortName += "." + portName
+				qualifiedDot += "." + portName
 			}
+			portsMap[qualifiedDot] = info
 
-			ports.Set(qualifiedPortName, ports[aliasedTo])
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				ports.Set(qualifiedPortName, ports[aliasedTo])
-			}
+			servicesMap.Set(label, portName, info)
 		}
 	}
 
@@ -499,12 +528,12 @@ func assignPorts(
 	// Give the kernel a bit of time to figure out what we've done.
 	time.Sleep(10 * time.Millisecond)
 
-	serializedPorts, err := ports.Marshal()
+	serializedPorts, err := portsMap.AssignedPorts().Marshal()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	os.Setenv("ASSIGNED_PORTS", string(serializedPorts))
-	return ports, reservedPorts, nil
+	return portsMap, servicesMap, reservedPorts, nil
 }
 
 func closeReservedPorts(reservedPorts map[string][]io.Closer) {
@@ -519,14 +548,11 @@ func closeReservedPorts(reservedPorts map[string][]io.Closer) {
 
 func augmentServiceSpecs(
 	serviceSpecs map[string]svclib.ServiceSpec,
-	ports svclib.Ports,
+	portsMap svclib.PortsMap,
 	svcctlPort string,
 ) (
 	map[string]svclib.VersionedServiceSpec, error,
 ) {
-	tmpDir := os.Getenv("TMPDIR")
-	socketDir := os.Getenv("SOCKET_DIR")
-
 	versionedServiceSpecs := make(map[string]svclib.VersionedServiceSpec, len(serviceSpecs))
 	for label, serviceSpec := range serviceSpecs {
 		s := svclib.VersionedServiceSpec{
@@ -538,11 +564,21 @@ func augmentServiceSpecs(
 			continue
 		}
 
-		exePath, err := runfiles.Rlocation(s.Exe)
-		if err != nil {
-			return nil, err
+		// Env is always present for spawned/external specs, but normalize defensively so the
+		// substitution and SVCCTL_PORT write below can assume a non-nil map.
+		if s.Env == nil {
+			s.Env = map[string]string{}
 		}
-		s.Exe = exePath
+
+		// External services are not spawned, but their health-check address/args may still
+		// reference ports/origins, so they go through substitution below.
+		if s.Type != "external_service" {
+			exePath, err := runfiles.Rlocation(s.Exe)
+			if err != nil {
+				return nil, err
+			}
+			s.Exe = exePath
+		}
 
 		if s.HealthCheck != "" {
 			healthCheckPath, err := runfiles.Rlocation(serviceSpec.HealthCheck)
@@ -568,7 +604,7 @@ func augmentServiceSpecs(
 		s.Color = logger.Colorize(s.Label)
 
 		if s.AutoassignPort {
-			port := ports[s.Label]
+			port := portsMap.Port(s.Label)
 			for i := range s.ServiceSpec.Args {
 				s.Args[i] = strings.ReplaceAll(s.Args[i], "$${PORT}", port)
 			}
@@ -585,18 +621,7 @@ func augmentServiceSpecs(
 		versionedServiceSpecs[label] = s
 	}
 
-	replacements := make([]Replacement, 0, 2+len(ports))
-	replacements = append(replacements,
-		Replacement{Old: "$${TMPDIR}", New: tmpDir},
-		Replacement{Old: "$${SOCKET_DIR}", New: socketDir},
-	)
-
-	for label, port := range ports {
-		replacements = append(replacements, Replacement{
-			Old: "$${" + label + "}",
-			New: port,
-		})
-	}
+	replacements := buildReplacements(portsMap, "$${")
 
 	replaceAllPorts := func(s string) string {
 		for _, r := range replacements {
@@ -630,17 +655,19 @@ type Replacement struct {
 // buildReplacements creates port/env substitution pairs.
 // prefix is "$${" for values from JSON files (which preserve literal $$),
 // or "${" for values from Bazel args (where $$ is already collapsed to $).
-func buildReplacements(ports svclib.Ports, prefix string) []Replacement {
-	replacements := make([]Replacement, 0, 2+len(ports))
+func buildReplacements(portsMap svclib.PortsMap, prefix string) []Replacement {
+	replacements := make([]Replacement, 0, 2+3*len(portsMap))
 	replacements = append(replacements,
 		Replacement{Old: prefix + "TMPDIR}", New: os.Getenv("TMPDIR")},
 		Replacement{Old: prefix + "SOCKET_DIR}", New: os.Getenv("SOCKET_DIR")},
 	)
-	for label, port := range ports {
-		replacements = append(replacements, Replacement{
-			Old: prefix + label + "}",
-			New: port,
-		})
+	for label, info := range portsMap {
+		replacements = append(replacements,
+			Replacement{Old: prefix + label + "}", New: info.Port},
+			// Rich origin/hostname tokens. A "::" delimiter is used since it can't appear in a label.
+			Replacement{Old: prefix + label + "::origin}", New: info.Origin},
+			Replacement{Old: prefix + label + "::hostname}", New: info.Hostname},
+		)
 	}
 	return replacements
 }
@@ -652,7 +679,7 @@ func replaceAll(s string, replacements []Replacement) string {
 	return s
 }
 
-func buildTestEnv(ports svclib.Ports) ([]string, error) {
+func buildTestEnv(portsMap svclib.PortsMap) ([]string, error) {
 	testEnvPath, err := runfiles.Rlocation(os.Getenv("SVCINIT_TEST_ENV_RLOCATION_PATH"))
 	if err != nil {
 		panic(err)
@@ -669,7 +696,7 @@ func buildTestEnv(ports svclib.Ports) ([]string, error) {
 		panic(err)
 	}
 
-	replacements := buildReplacements(ports, "$${")
+	replacements := buildReplacements(portsMap, "$${")
 
 	// Note, this can technically specify the same var multiple times.
 	// Last one wins - hope that's what you wanted!

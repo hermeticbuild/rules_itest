@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "tcp_probe_lib",
+    srcs = ["main.go"],
+    importpath = "rules_itest/tests/ports/tcp_probe",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "tcp_probe",
+    embed = [":tcp_probe_lib"],
+    visibility = ["//visibility:public"],
+)
