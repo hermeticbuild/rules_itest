@@ -43,6 +43,12 @@ def named_port_alias(label, name):
     """
     return _to_relative_named_port(label, name)
 
+def _normalize_labels(labels):
+    return [
+        str(native.package_relative_label(label))
+        for label in labels
+    ]
+
 def itest_service(name, tags = [], hygienic = True, named_ports = [], **kwargs):
     if "port" in kwargs:
         fail("Do not specify `port`, instead set it via the `%s` flag" % (name + ".port"))
@@ -64,6 +70,7 @@ def itest_service(name, tags = [], hygienic = True, named_ports = [], **kwargs):
 
     _itest_service(
         name = name,
+        dep_labels_internal = _normalize_labels(kwargs.get("deps", [])),
         tags = tags + ["ibazel_notify_changes"],
         port = name + ".port",
         named_ports = named_ports_attr,
@@ -78,6 +85,7 @@ def itest_service(name, tags = [], hygienic = True, named_ports = [], **kwargs):
 
 def itest_service_group(name, tags = [], hygienic = True, **kwargs):
     _itest_service_group(
+        service_labels_internal = _normalize_labels(kwargs.get("services", [])),
         name = name,
         tags = tags + ["ibazel_notify_changes"],
         **kwargs
@@ -91,6 +99,7 @@ def itest_service_group(name, tags = [], hygienic = True, **kwargs):
 
 def itest_task(name, tags = [], hygienic = True, **kwargs):
     _itest_task(
+        dep_labels_internal = _normalize_labels(kwargs.get("deps", [])),
         name = name,
         tags = tags + ["ibazel_notify_changes"],
         **kwargs
@@ -110,4 +119,8 @@ def _hygiene_test(name, **kwargs):
         **kwargs
     )
 
-service_test = _service_test
+def service_test(**kwargs):
+    _service_test(
+        service_labels_internal = _normalize_labels(kwargs.get("services", [])),
+        **kwargs
+    )
