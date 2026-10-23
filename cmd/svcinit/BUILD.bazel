@@ -60,8 +60,12 @@ go_library(
 
 go_test(
     name = "svcinit_test",
-    srcs = ["reserve_reusable_port_test.go"],
+    srcs = [
+        "reserve_reusable_port_test.go",
+        "reserve_unshared_port_unix_test.go",
+    ],
     embed = [":svcinit_lib"],
+    deps = ["//svclib"],
 )
 
 go_binary(

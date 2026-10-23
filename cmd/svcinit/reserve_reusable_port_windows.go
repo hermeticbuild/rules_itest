@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-	"syscall"
 
 	"golang.org/x/sys/windows"
 )
@@ -39,10 +38,7 @@ func reserveReusablePort(port int) (io.Closer, string, error) {
 		}
 	}()
 
-	if err := setSockoptsForPortAssignment(uintptr(socket), &syscall.Linger{
-		Onoff:  1,
-		Linger: 0,
-	}); err != nil {
+	if err := setSockoptsForPortAssignment(uintptr(socket), true); err != nil {
 		return nil, "", fmt.Errorf("set reusable reservation socket options: %w", err)
 	}
 

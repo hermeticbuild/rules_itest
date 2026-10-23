@@ -28,10 +28,7 @@ func reserveReusablePort(port int) (io.Closer, string, error) {
 	// Do not set SO_REUSEADDR here. Go TCP listeners enable it by default on
 	// Linux, where it would allow an unaware listener to claim a bind-only
 	// reservation. SO_REUSEPORT alone allows the aware service to share it.
-	if err := setSockoptsForPortAssignment(uintptr(fd), &syscall.Linger{
-		Onoff:  1,
-		Linger: 0,
-	}); err != nil {
+	if err := setSockoptsForPortAssignment(uintptr(fd), true); err != nil {
 		return nil, "", fmt.Errorf("set reusable reservation socket options: %w", err)
 	}
 
