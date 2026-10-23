@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"math"
 	"net"
 	"os"
@@ -48,7 +47,7 @@ var (
 var getAssignedPortRlocationPath string
 
 func main() {
-	start := time.Now()
+	runStart := time.Now()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -66,8 +65,9 @@ func main() {
 	shouldHotReload := os.Getenv("IBAZEL_NOTIFY_CHANGES") == "y"
 	testLabel := os.Getenv("TEST_TARGET")
 
-	interactiveCh := make(chan string, 100)
+	var interactiveCh chan string
 	if shouldHotReload {
+		interactiveCh = make(chan string, 100)
 		go func() {
 			scanner := bufio.NewScanner(os.Stdin)
 			for scanner.Scan() {
@@ -117,7 +117,7 @@ func main() {
 
 	isOneShot := !shouldHotReload && testLabel != "" && !shouldKeepServicesUp
 
-	unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
+	activeSpecs, err := readServiceSpecs(serviceSpecsPath)
 	must(err)
 
 	// Make sure we grab the svcctl port before we assign test ports,
@@ -125,9 +125,13 @@ func main() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(err)
 
-	ports, reservedPorts, err := assignPorts(unversionedSpecs)
+	ports, reservedPorts, err := assignPorts(activeSpecs)
 	must(err)
-	defer closeReservedPorts(reservedPorts)
+	defer func() {
+		if err := closePorts(reservedPorts); err != nil {
+			log.Printf("failed to close reusable port reservations: %v", err)
+		}
+	}()
 
 	svcctlPort := listener.Addr().(*net.TCPAddr).Port
 	svcctlPortStr := strconv.Itoa(svcctlPort)
@@ -139,7 +143,7 @@ func main() {
 		defer os.Remove("/tmp/svcctl_port")
 	}
 
-	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+	serviceSpecs, err := augmentServiceSpecs(activeSpecs, ports, svcctlPortStr)
 	must(err)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -155,7 +159,7 @@ func main() {
 		return states
 	})
 
-	servicesErrCh := make(chan error, len(unversionedSpecs))
+	servicesErrCh := make(chan error, len(activeSpecs))
 
 	go func() {
 		defer listener.Close()
@@ -206,8 +210,8 @@ func main() {
 		must(err)
 
 		var testCmd *exec.Cmd
-		testCtx, testCancel := context.WithCancel(ctx)
-		testErrCh := make(chan error, 1)
+		var testCancel context.CancelFunc
+		var testErrCh chan error
 		if testLabel != "" {
 			// Bazel's args attribute converts $$ to $, so args arrive with
 			// single-$ placeholders (e.g. ${@@//:svc}) unlike env/spec files
@@ -229,6 +233,8 @@ func main() {
 			}
 			testStartTime := time.Now()
 
+			testCtx, cancel := context.WithCancel(ctx)
+			testCancel = cancel
 			testCmd = exec.CommandContext(testCtx, testPath, testArgs...)
 			testCmd.Env = testEnv
 
@@ -239,7 +245,7 @@ func main() {
 				if err != nil {
 					fmt.Println(err)
 				} else {
-					timeoutVal -= int(math.Ceil(testStartTime.Sub(start).Seconds()))
+					timeoutVal -= int(math.Ceil(testStartTime.Sub(runStart).Seconds()))
 					testCmd.Env = append(testCmd.Env, "TEST_TIMEOUT="+strconv.Itoa(timeoutVal))
 				}
 			}
@@ -251,11 +257,12 @@ func main() {
 				panic(err)
 			}
 
+			testErrCh = make(chan error, 1)
 			go func() {
-				testErrCh <- testCmd.Wait()
-
+				err := testCmd.Wait()
 				testDuration := time.Since(testStartTime)
 				log.Printf("Test duration: %s\n", testDuration)
+				testErrCh <- err
 			}()
 		}
 
@@ -274,88 +281,180 @@ func main() {
 			fmt.Println()
 		}
 
-		select {
-		case <-ctx.Done():
+		prepareReload := func(notification []byte) (func(), error) {
+			next, err := readServiceSpecs(serviceSpecsPath)
+			if err != nil {
+				return nil, fmt.Errorf("read service specs: %w", err)
+			}
+			if err := checkPortReload(activeSpecs, next, ports); err != nil {
+				return nil, err
+			}
+
+			serviceSpecs, err := augmentServiceSpecs(next, ports, svcctlPortStr)
+			if err != nil {
+				return nil, fmt.Errorf("augment service specs: %w", err)
+			}
+
+			return func() {
+				// This is a brittle way of draining a channel in a nonblocking way,
+				// consider instead signalling cancellation of the services with a
+				// context, letting them close the channel, and using a waitgroup to
+				// wait for them to exit.
+				// See: https://github.com/hermeticbuild/rules_itest/issues/72
+			Drain:
+				for {
+					select {
+					case crashErr := <-servicesErrCh:
+						log.Printf("Discarding pending service error before reload: %v", crashErr)
+					default:
+						break Drain
+					}
+				}
+
+				runStart = startRun(func() {
+					criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, notification)
+					must(err)
+					activeSpecs = next
+				})
+			}, nil
+		}
+		report := func() {
+			testCancel()
+			if isOneShot {
+				buf.WriteString("Target\tUser Time\tSystem Time\n")
+				states := mustStopAllForExit()
+				for label, state := range states {
+					buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
+						label, state.UserTime(), state.SystemTime()))
+				}
+			} else {
+				buf.WriteString("Target\tStartup Time\n")
+				durations := r.GetStartDurations()
+				for label, duration := range durations {
+					buf.WriteString(fmt.Sprintf("%s\t%s\n", label, duration))
+				}
+			}
+
+			if testLabel != "" {
+				buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
+					testLabel, testCmd.ProcessState.UserTime(), testCmd.ProcessState.SystemTime()))
+			}
+			buf.WriteRune('\n')
+			_, err = reportWriter.Write(buf.Bytes())
+			must(err)
+			buf.Reset()
+			err = reportWriter.Flush()
+			must(err)
+		}
+
+		switch waitForRun(ctx, isOneShot, interactiveCh, testErrCh, servicesErrCh, testCancel, prepareReload, report) {
+		case runComplete:
+			if isOneShot {
+				return
+			}
+		case runTestFailed:
+			mustStopAllForExit()
+			os.Exit(1)
+		case runServiceFailed:
+			mustStopAllForExit()
+			log.Fatal("Service exited uncleanly, marking test as failed.\n\n")
+		case runShutdown:
 			log.Println("Shutting down services.")
 			mustStopAllForExit()
 			log.Println("Cleaning up.")
 			return
-		case ibazelCmd := <-interactiveCh:
-			log.Println(ibazelCmd)
+		}
+	}
+}
 
-			// Restart any services as needed.
-			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
-			must(err)
+func startRun(startServices func()) time.Time {
+	start := time.Now()
+	startServices()
+	return start
+}
 
-			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
-			must(err)
+const successfulBuild = "IBAZEL_BUILD_COMPLETED SUCCESS"
 
-			testCancel()
+type runEvent int
 
-			// This is a brittle way of draining a channel in a nonblocking way,
-			// consider instead signalling cancellation of the services with a
-			// context, letting them close the channel, and using a waitgroup to
-			// wait for them to exit.
-			// See: https://github.com/hermeticbuild/rules_itest/issues/72
-		Drain:
-			for {
+const (
+	runComplete runEvent = iota
+	runTestFailed
+	runServiceFailed
+	runShutdown
+)
+
+// A nil builds channel means the run is not managed by iBazel; a nil tests
+// channel means there is no active test. prepareReload validates a build and
+// returns the service restart to perform after the current test has finished.
+func waitForRun(ctx context.Context, oneShot bool, builds <-chan string, tests, services <-chan error, cancelTest context.CancelFunc, prepareReload func([]byte) (func(), error), report func()) runEvent {
+	for {
+		var testErr error
+		var restart func()
+		cancelRequested := false
+		select {
+		case <-ctx.Done():
+			return runShutdown
+		case cmd := <-builds:
+			log.Println(cmd)
+			if cmd != successfulBuild {
+				continue
+			}
+			var err error
+			restart, err = prepareReload([]byte(cmd + "\n"))
+			if err != nil {
+				log.Printf("Skipping reload: %v", err)
+				continue
+			}
+			if tests != nil {
 				select {
-				case crashErr := <-servicesErrCh:
-					log.Printf("Discarding pending service error before reload: %v", crashErr)
+				case testErr = <-tests:
 				default:
-					break Drain
+					cancelRequested = true
+					cancelTest()
+					testErr = <-tests
 				}
 			}
-
-			criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(ibazelCmd))
-			must(err)
-
+		case testErr = <-tests:
+		case err := <-services:
+			log.Print(err)
+			if oneShot {
+				return runServiceFailed
+			}
 			continue
+		}
 
-		case testErr := <-testErrCh:
+		if tests != nil {
 			if testErr != nil {
-				log.Printf("Encountered error during test run: %s\n", testErr)
-				if isOneShot {
-					mustStopAllForExit()
-					os.Exit(1)
+				if cancelRequested {
+					log.Printf("Test exited while stopping for reload: %v", testErr)
+				} else {
+					log.Printf("Encountered error during test run: %s\n", testErr)
 				}
 			}
-		case serviceErr := <-servicesErrCh:
-			log.Print(serviceErr)
-			if isOneShot {
-				mustStopAllForExit()
-				log.Fatal("Service exited uncleanly, marking test as failed.\n\n")
+			if oneShot {
+				// Do not report success if a service failure is already pending.
+				select {
+				case serviceErr := <-services:
+					log.Print(serviceErr)
+					return runServiceFailed
+				default:
+				}
+				if testErr != nil {
+					return runTestFailed
+				}
 			}
+			report()
+			tests = nil
 		}
-
-		if isOneShot {
-			buf.WriteString("Target\tUser Time\tSystem Time\n")
-			states := mustStopAllForExit()
-			for label, state := range states {
-				buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
-					label, state.UserTime(), state.SystemTime()))
+		if restart != nil {
+			if ctx.Err() != nil {
+				return runShutdown
 			}
-		} else {
-			buf.WriteString("Target\tStartup Time\n")
-			durations := r.GetStartDurations()
-			for label, duration := range durations {
-				buf.WriteString(fmt.Sprintf("%s\t%s\n", label, duration))
-			}
+			restart()
 		}
-
-		if testLabel != "" {
-			buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
-				testLabel, testCmd.ProcessState.UserTime(), testCmd.ProcessState.SystemTime()))
-		}
-		buf.WriteRune('\n')
-		_, err = reportWriter.Write(buf.Bytes())
-		must(err)
-		buf.Reset()
-		err = reportWriter.Flush()
-		must(err)
-
-		if isOneShot {
-			break
+		if oneShot || restart != nil {
+			return runComplete
 		}
 	}
 }
@@ -366,7 +465,9 @@ func readServiceSpecs(
 	map[string]svclib.ServiceSpec, error,
 ) {
 	data, err := os.ReadFile(path)
-	must(err)
+	if err != nil {
+		return nil, err
+	}
 
 	var serviceSpecs map[string]svclib.ServiceSpec
 	err = json.Unmarshal(data, &serviceSpecs)
@@ -376,127 +477,52 @@ func readServiceSpecs(
 func assignPorts(
 	serviceSpecs map[string]svclib.ServiceSpec,
 ) (
-	svclib.Ports, map[string][]io.Closer, error,
+	_ svclib.Ports, _ []io.Closer, err error,
 ) {
-	var toClose []io.Closer
-	reservedPorts := map[string][]io.Closer{}
-	ports := svclib.Ports{}
+	var toClose, reservedPorts []io.Closer
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, closePorts(toClose), closePorts(reservedPorts))
+		}
+	}()
+	assigned := make(map[portName]string)
 
 	for label, spec := range serviceSpecs {
-		namedPorts := maps.Clone(spec.NamedPorts)
-		if spec.AutoassignPort {
-			namedPorts[""] = spec.Port
-		}
-
 		// Note, this can cause collisions. So be careful!
 		// To avoid port collisions, set so_reuseport_aware on the service definition
 		// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
-		for portName, port := range namedPorts {
-			var reservedPort io.Closer
-			var err error
-			if spec.SoReuseportAware {
-				requestedPort, parseErr := strconv.Atoi(port)
-				if parseErr != nil || requestedPort < 0 || requestedPort > 65535 {
-					return nil, nil, fmt.Errorf("invalid port %q for %s", port, label)
-				}
-				reservedPort, port, err = reserveReusablePort(requestedPort)
-				if err != nil {
-					return nil, nil, err
-				}
-			} else {
-				// We do a bit of a dance here to set SO_LINGER to 0. For details, see
-				// https://stackoverflow.com/questions/71975992/what-really-is-the-linger-time-that-can-be-set-with-so-linger-on-sockets
-				lc := net.ListenConfig{
-					Control: func(network, address string, conn syscall.RawConn) error {
-						var setSockoptErr error
-						err := conn.Control(func(fd uintptr) {
-							setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
-								Onoff:  1,
-								Linger: 0,
-							})
-						})
-						if err != nil {
-							return err
-						}
-						return setSockoptErr
-					},
-				}
-
-				listener, listenErr := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
-				if listenErr != nil {
-					return nil, nil, listenErr
-				}
-				_, port, err = net.SplitHostPort(listener.Addr().String())
-				if err != nil {
-					listener.Close()
-					return nil, nil, err
-				}
-				reservedPort = listener
+		for name, port := range namedPorts(spec) {
+			key := portName{label, name}
+			sockets, port, err := reserveServicePort(spec.PortFamily, port, spec.SoReuseportAware)
+			if err != nil {
+				return nil, nil, fmt.Errorf("assign port for %s: %w", key.qualified("."), err)
 			}
-
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
-			}
-
+			assigned[key] = port
 			if !terseOutput {
-				log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-			}
-
-			ports.Set(qualifiedPortName, port)
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				if !terseOutput {
-					log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-				}
-
-				ports.Set(qualifiedPortName, port)
+				log.Printf("Assigning port %s to %s\n", port, key.qualified("."))
 			}
 
 			if !spec.SoReuseportAware {
-				toClose = append(toClose, reservedPort)
+				toClose = append(toClose, sockets...)
 			} else {
-				reservedPorts[label] = append(reservedPorts[label], reservedPort)
+				reservedPorts = append(reservedPorts, sockets...)
 			}
 		}
 	}
 
-	for _, reservedPort := range toClose {
-		err := reservedPort.Close()
-		if err != nil {
-			return nil, nil, err
-		}
+	err = closePorts(toClose)
+	toClose = nil
+	if err != nil {
+		return nil, nil, fmt.Errorf("close port reservations: %w", err)
 	}
 
-	for label, spec := range serviceSpecs {
-		for portName, aliasedTo := range spec.PortAliases {
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
-			}
-
-			ports.Set(qualifiedPortName, ports[aliasedTo])
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				ports.Set(qualifiedPortName, ports[aliasedTo])
-			}
-		}
+	ports, err := publicPorts(assigned, serviceSpecs)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	// Complete hack - we have observed that the ports may not be ready immediately after closing, even with SO_LINGER set to 0.
-	// Give the kernel a bit of time to figure out what we've done.
+	// Service binds have sometimes failed immediately after reservations were
+	// released. Give the kernel time to make the ports available.
 	time.Sleep(10 * time.Millisecond)
 
 	serializedPorts, err := ports.Marshal()
@@ -507,14 +533,14 @@ func assignPorts(
 	return ports, reservedPorts, nil
 }
 
-func closeReservedPorts(reservedPorts map[string][]io.Closer) {
-	for label, ports := range reservedPorts {
-		for _, port := range ports {
-			if err := port.Close(); err != nil {
-				log.Printf("failed to close reusable port reservation for %s: %v\n", label, err)
-			}
+func closePorts(ports []io.Closer) error {
+	var errs []error
+	for _, port := range ports {
+		if err := port.Close(); err != nil {
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func augmentServiceSpecs(
