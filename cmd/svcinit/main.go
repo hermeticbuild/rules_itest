@@ -117,7 +117,7 @@ func main() {
 
 	isOneShot := !shouldHotReload && testLabel != "" && !shouldKeepServicesUp
 
-	startupSpecs, err := readServiceSpecs(serviceSpecsPath)
+	activeSpecs, err := readServiceSpecs(serviceSpecsPath)
 	must(err)
 
 	// Make sure we grab the svcctl port before we assign test ports,
@@ -125,7 +125,7 @@ func main() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(err)
 
-	ports, reservedPorts, err := assignPorts(startupSpecs)
+	ports, reservedPorts, err := assignPorts(activeSpecs)
 	must(err)
 	defer func() {
 		if err := closePorts(reservedPorts); err != nil {
@@ -143,7 +143,7 @@ func main() {
 		defer os.Remove("/tmp/svcctl_port")
 	}
 
-	serviceSpecs, err := augmentServiceSpecs(startupSpecs, ports, svcctlPortStr)
+	serviceSpecs, err := augmentServiceSpecs(activeSpecs, ports, svcctlPortStr)
 	must(err)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -159,7 +159,7 @@ func main() {
 		return states
 	})
 
-	servicesErrCh := make(chan error, len(startupSpecs))
+	servicesErrCh := make(chan error, len(activeSpecs))
 
 	go func() {
 		defer listener.Close()
@@ -286,7 +286,7 @@ func main() {
 			if err != nil {
 				return nil, fmt.Errorf("read service specs: %w", err)
 			}
-			if err := checkPortReload(startupSpecs, next, ports); err != nil {
+			if err := checkPortReload(activeSpecs, next, ports); err != nil {
 				return nil, err
 			}
 
@@ -314,6 +314,7 @@ func main() {
 				runStart = startRun(func() {
 					criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, notification)
 					must(err)
+					activeSpecs = next
 				})
 			}, nil
 		}
@@ -492,7 +493,7 @@ func assignPorts(
 		// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
 		for name, port := range namedPorts(spec) {
 			key := portName{label, name}
-			reservedPort, port, err := reserveServicePort(port, spec.SoReuseportAware)
+			sockets, port, err := reserveServicePort(spec.PortFamily, port, spec.SoReuseportAware)
 			if err != nil {
 				return nil, nil, fmt.Errorf("assign port for %s: %w", key.qualified("."), err)
 			}
@@ -502,9 +503,9 @@ func assignPorts(
 			}
 
 			if !spec.SoReuseportAware {
-				toClose = append(toClose, reservedPort)
+				toClose = append(toClose, sockets...)
 			} else {
-				reservedPorts = append(reservedPorts, reservedPort)
+				reservedPorts = append(reservedPorts, sockets...)
 			}
 		}
 	}
@@ -520,8 +521,8 @@ func assignPorts(
 		return nil, nil, err
 	}
 
-	// Complete hack - we have observed that the ports may not be ready immediately after closing, even with SO_LINGER set to 0.
-	// Give the kernel a bit of time to figure out what we've done.
+	// Service binds have sometimes failed immediately after reservations were
+	// released. Give the kernel time to make the ports available.
 	time.Sleep(10 * time.Millisecond)
 
 	serializedPorts, err := ports.Marshal()
@@ -530,42 +531,6 @@ func assignPorts(
 	}
 	os.Setenv("ASSIGNED_PORTS", string(serializedPorts))
 	return ports, reservedPorts, nil
-}
-
-func reserveServicePort(port string, reusable bool) (io.Closer, string, error) {
-	var requestedPort int
-	if reusable {
-		var err error
-		requestedPort, err = strconv.Atoi(port)
-		if err != nil || requestedPort < 0 || requestedPort > 65535 {
-			return nil, "", fmt.Errorf("invalid port %q", port)
-		}
-		if requestedPort == 0 {
-			return reserveReusablePort(0)
-		}
-	}
-
-	lc := net.ListenConfig{Control: func(_, _ string, conn syscall.RawConn) error {
-		var optErr error
-		err := conn.Control(func(fd uintptr) {
-			optErr = setSockoptsForPortAssignment(fd, false)
-		})
-		return errors.Join(err, optErr)
-	}}
-	listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
-	if err != nil {
-		return nil, "", err
-	}
-	if !reusable {
-		return listener, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port), nil
-	}
-
-	// A reusable bind alone can join an existing listener. This exclusive
-	// probe rejects occupied ports, with a small race until the reusable bind.
-	if err := listener.Close(); err != nil {
-		return nil, "", fmt.Errorf("close availability probe: %w", err)
-	}
-	return reserveReusablePort(requestedPort)
 }
 
 func closePorts(ports []io.Closer) error {

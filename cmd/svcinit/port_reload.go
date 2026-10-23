@@ -42,6 +42,9 @@ func checkPortReload(active, next map[string]svclib.ServiceSpec, ports svclib.Po
 			if want != 0 && strconv.FormatUint(want, 10) != number {
 				return restart(public)
 			}
+			if !canReloadFamily(previous, spec) {
+				return restart(public)
+			}
 			assigned[key] = number
 		}
 	}
@@ -61,4 +64,9 @@ func checkPortReload(active, next map[string]svclib.ServiceSpec, ports svclib.Po
 		return fmt.Errorf("published port names or numbers changed; restart the service manager to reassign ports")
 	}
 	return nil
+}
+
+func canReloadFamily(active, next svclib.ServiceSpec) bool {
+	from, to := portFamily(active.PortFamily), portFamily(next.PortFamily)
+	return from == to || (from == "dual-stack" && !active.SoReuseportAware && (to == "ipv4" || to == "ipv6"))
 }

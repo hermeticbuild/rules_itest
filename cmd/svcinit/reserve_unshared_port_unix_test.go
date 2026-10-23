@@ -41,9 +41,9 @@ func TestBoundSocketOccupiesServicePort(t *testing.T) {
 func requireServicePortOccupied(t *testing.T, port int) {
 	t.Helper()
 	for _, reusable := range []bool{false, true} {
-		reservation, _, err := reserveServicePort(strconv.Itoa(port), reusable)
-		if reservation != nil {
-			reservation.Close()
+		reservation, _, err := reserveServicePort("ipv4", strconv.Itoa(port), reusable)
+		if closeErr := closePorts(reservation); closeErr != nil {
+			t.Error(closeErr)
 		}
 		if !errors.Is(err, syscall.EADDRINUSE) {
 			t.Errorf("reuse-aware=%t: assigning occupied port %d: got %v, want EADDRINUSE", reusable, port, err)

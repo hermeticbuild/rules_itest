@@ -20,6 +20,8 @@ forward the ibazel hot-reload notification over stdin instead of restarting the 
 
 A reload must preserve the published port names and numbers, the services that own the ports, and their reservation
 modes. Restart the service manager to change them. An incompatible build leaves the running services and test alone.
+An ordinary dual-stack port may narrow to one family on reload, but cannot later expand or switch families without
+restarting the manager. A reusable port keeps its family because its reservations remain bound.
 
 # Reusable port reservations
 
@@ -216,6 +218,7 @@ def _itest_service_impl(ctx):
         "http_health_check_address": ctx.attr.http_health_check_address,
         "port": str(ctx.attr.port[BuildSettingInfo].value),
         "autoassign_port": ctx.attr.autoassign_port,
+        "port_family": ctx.attr.port_family,
         "so_reuseport_aware": ctx.attr.so_reuseport_aware,
         "deferred": ctx.attr.deferred,
         "named_ports": {
@@ -264,6 +267,13 @@ _itest_service_attrs = _itest_binary_attrs | {
         `PORT=$($GET_ASSIGNED_PORT_BIN @@//label/for:service)`""",
     ),
     "port": attr.label(doc = "Internal"),
+    "port_family": attr.string(
+        default = "ipv4",
+        doc = """IP family for checking each assigned TCP port on loopback: `ipv4` (`127.0.0.1`), `ipv6` (`::1`), or `dual-stack` (both).
+        Applies to the autoassigned port and named ports, including fixed port overrides. This only controls port assignment; configure the service's listener and health check separately.
+        Reservations are released before the service starts unless `so_reuseport_aware` is enabled; neither mode eliminates all races.""",
+        values = ["ipv4", "ipv6", "dual-stack"],
+    ),
     "named_ports": attr.label_keyed_string_dict(
         doc = """For each element of the list, the service manager will pick a free port and assign it to the service.
         The port's fully-qualified name is the service's fully-qualified label and the port name, separated by a colon.

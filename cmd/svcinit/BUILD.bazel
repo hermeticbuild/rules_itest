@@ -3,13 +3,12 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "svcinit_lib",
     srcs = [
+        "loopback_ports.go",
+        "loopback_ports_unix.go",
+        "loopback_ports_windows.go",
         "main.go",
         "port_names.go",
         "port_reload.go",
-        "reserve_reusable_port_unix.go",
-        "reserve_reusable_port_windows.go",
-        "set_sockopts_for_port_assignment_unix.go",
-        "set_sockopts_for_port_assignment_windows.go",
     ],
     importpath = "rules_itest/cmd/svcinit",
     visibility = ["//visibility:private"],
@@ -63,6 +62,7 @@ go_library(
 go_test(
     name = "svcinit_test",
     srcs = [
+        "loopback_ports_test.go",
         "main_test.go",
         "port_names_test.go",
         "port_reload_test.go",

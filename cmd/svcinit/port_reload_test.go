@@ -64,3 +64,27 @@ func TestReloadKeepsPhysicalPortOwners(t *testing.T) {
 		t.Fatal("replaced a physical port with an alias without changing the published table")
 	}
 }
+
+func TestReloadPortFamily(t *testing.T) {
+	specs := func(family string, reusable bool) map[string]svclib.ServiceSpec {
+		return map[string]svclib.ServiceSpec{"svc": {AutoassignPort: true, Port: "0", PortFamily: family, SoReuseportAware: reusable}}
+	}
+	check := func(active, next map[string]svclib.ServiceSpec, compatible bool) {
+		t.Helper()
+		if err := checkPortReload(active, next, svclib.Ports{"svc": "8000"}); (err == nil) != compatible {
+			t.Fatalf("reload from %+v to %+v: got %v, want compatible=%t", active["svc"], next["svc"], err, compatible)
+		}
+	}
+
+	active := specs("dual-stack", false)
+	check(active, specs("ipv6", false), true)
+	next := specs("ipv4", false)
+	check(active, next, true)
+	active = next
+	check(active, specs("dual-stack", false), false)
+	check(active, specs("ipv6", false), false)
+	check(specs("", false), active, true)
+	reusable := specs("dual-stack", true)
+	check(reusable, reusable, true)
+	check(reusable, specs("ipv4", true), false)
+}
