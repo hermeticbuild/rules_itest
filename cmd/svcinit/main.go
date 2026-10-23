@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"math"
 	"net"
 	"os"
@@ -118,7 +117,7 @@ func main() {
 
 	isOneShot := !shouldHotReload && testLabel != "" && !shouldKeepServicesUp
 
-	unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
+	startupSpecs, err := readServiceSpecs(serviceSpecsPath)
 	must(err)
 
 	// Make sure we grab the svcctl port before we assign test ports,
@@ -126,7 +125,7 @@ func main() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(err)
 
-	ports, reservedPorts, err := assignPorts(unversionedSpecs)
+	ports, reservedPorts, err := assignPorts(startupSpecs)
 	must(err)
 	defer closeReservedPorts(reservedPorts)
 
@@ -140,7 +139,7 @@ func main() {
 		defer os.Remove("/tmp/svcctl_port")
 	}
 
-	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+	serviceSpecs, err := augmentServiceSpecs(startupSpecs, ports, svcctlPortStr)
 	must(err)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -156,7 +155,7 @@ func main() {
 		return states
 	})
 
-	servicesErrCh := make(chan error, len(unversionedSpecs))
+	servicesErrCh := make(chan error, len(startupSpecs))
 
 	go func() {
 		defer listener.Close()
@@ -279,12 +278,15 @@ func main() {
 		}
 
 		prepareReload := func(notification []byte) (func(), error) {
-			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
+			next, err := readServiceSpecs(serviceSpecsPath)
 			if err != nil {
 				return nil, fmt.Errorf("read service specs: %w", err)
 			}
+			if err := checkPortReload(startupSpecs, next, ports); err != nil {
+				return nil, err
+			}
 
-			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+			serviceSpecs, err := augmentServiceSpecs(next, ports, svcctlPortStr)
 			if err != nil {
 				return nil, fmt.Errorf("augment service specs: %w", err)
 			}
@@ -477,15 +479,10 @@ func assignPorts(
 	assigned := make(map[portName]string)
 
 	for label, spec := range serviceSpecs {
-		namedPorts := maps.Clone(spec.NamedPorts)
-		if spec.AutoassignPort {
-			namedPorts[""] = spec.Port
-		}
-
 		// Note, this can cause collisions. So be careful!
 		// To avoid port collisions, set so_reuseport_aware on the service definition
 		// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
-		for name, port := range namedPorts {
+		for name, port := range namedPorts(spec) {
 			var reservedPort io.Closer
 			var err error
 			if spec.SoReuseportAware {

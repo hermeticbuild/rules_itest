@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "main.go",
         "port_names.go",
+        "port_reload.go",
         "reserve_reusable_port_unix.go",
         "reserve_reusable_port_windows.go",
         "set_sockopts_for_port_assignment_unix.go",
@@ -64,6 +65,7 @@ go_test(
     srcs = [
         "main_test.go",
         "port_names_test.go",
+        "port_reload_test.go",
         "reserve_reusable_port_test.go",
     ],
     embed = [":svcinit_lib"],

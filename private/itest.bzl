@@ -18,6 +18,9 @@ query:enable-reload --@rules_itest//:enable_per_service_reload
 In addition, if the `hot_reloadable` attribute is set on an `itest_service`, the service manager will
 forward the ibazel hot-reload notification over stdin instead of restarting the service.
 
+A reload must preserve the published port names and numbers, the services that own the ports, and their reservation
+modes. Restart the service manager to change them. An incompatible build leaves the running services and test alone.
+
 # Reusable port reservations
 
 For each service with `so_reuseport_aware = True`, the service manager adds
