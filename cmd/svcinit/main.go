@@ -380,7 +380,7 @@ func assignPorts(
 ) {
 	var toClose []io.Closer
 	reservedPorts := map[string][]io.Closer{}
-	ports := svclib.Ports{}
+	assigned := make(map[portName]string)
 
 	for label, spec := range serviceSpecs {
 		namedPorts := maps.Clone(spec.NamedPorts)
@@ -391,7 +391,7 @@ func assignPorts(
 		// Note, this can cause collisions. So be careful!
 		// To avoid port collisions, set so_reuseport_aware on the service definition
 		// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
-		for portName, port := range namedPorts {
+		for name, port := range namedPorts {
 			var reservedPort io.Closer
 			var err error
 			if spec.SoReuseportAware {
@@ -434,29 +434,10 @@ func assignPorts(
 				reservedPort = listener
 			}
 
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
-			}
-
+			key := portName{label, name}
+			assigned[key] = port
 			if !terseOutput {
-				log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-			}
-
-			ports.Set(qualifiedPortName, port)
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				if !terseOutput {
-					log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-				}
-
-				ports.Set(qualifiedPortName, port)
+				log.Printf("Assigning port %s to %s\n", port, key.qualified("."))
 			}
 
 			if !spec.SoReuseportAware {
@@ -474,25 +455,10 @@ func assignPorts(
 		}
 	}
 
-	for label, spec := range serviceSpecs {
-		for portName, aliasedTo := range spec.PortAliases {
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
-			}
-
-			ports.Set(qualifiedPortName, ports[aliasedTo])
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				ports.Set(qualifiedPortName, ports[aliasedTo])
-			}
-		}
+	ports, err := publicPorts(assigned, serviceSpecs)
+	if err != nil {
+		closeReservedPorts(reservedPorts)
+		return nil, nil, err
 	}
 
 	// Complete hack - we have observed that the ports may not be ready immediately after closing, even with SO_LINGER set to 0.
