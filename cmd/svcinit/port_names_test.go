@@ -47,7 +47,9 @@ func TestInvalidGroupPortAliases(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ports, held, err := assignPorts(test.specs)
 			if err == nil {
-				closeReservedPorts(held)
+				if err := closePorts(held); err != nil {
+					t.Error(err)
+				}
 				t.Fatalf("published invalid port assignments: %v", ports)
 			}
 			if !strings.Contains(err.Error(), test.want) {

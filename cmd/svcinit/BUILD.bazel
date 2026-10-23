@@ -67,6 +67,7 @@ go_test(
         "port_names_test.go",
         "port_reload_test.go",
         "reserve_reusable_port_test.go",
+        "reserve_unshared_port_unix_test.go",
     ],
     embed = [":svcinit_lib"],
     deps = ["//svclib"],
