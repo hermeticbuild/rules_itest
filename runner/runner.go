@@ -189,10 +189,9 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 
 	for _, label := range updateActions.toStopLabels {
 		serviceInstance := r.serviceInstances[label]
-		if serviceInstance.Type == "group" {
-			continue
+		if serviceInstance.Type != "group" {
+			serviceInstance.Stop()
 		}
-		serviceInstance.Stop()
 		delete(r.serviceInstances, label)
 	}
 
