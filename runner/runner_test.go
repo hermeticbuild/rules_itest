@@ -33,3 +33,22 @@ func TestStartAllSkipsAlreadyRunningServices(t *testing.T) {
 		t.Fatalf("StartAll() returned an error for an already-running service: %v", err)
 	}
 }
+
+func TestUpdateSpecsAndRestartRemovesGroup(t *testing.T) {
+	service := svclib.ServiceSpec{Type: "service", Label: "//:service", Exe: os.Args[0]}
+	group := svclib.ServiceSpec{Type: "group", Label: "//:group", Deps: []string{service.Label}}
+	r, err := New(context.Background(), ServiceSpecs{
+		service.Label: {ServiceSpec: service},
+		group.Label:   {ServiceSpec: group},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.UpdateSpecsAndRestart(ServiceSpecs{}, make(chan error, 1), nil); err != nil {
+		t.Fatal(err)
+	}
+	if instance := r.GetInstance(group.Label); instance != nil {
+		t.Fatalf("GetInstance(%q) = %v, want nil", group.Label, instance)
+	}
+}

@@ -12,7 +12,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Test
+      - name: Unit tests
+        run: bazel test //...
+
+      - name: Integration tests
         working-directory: tests
         # TODO(zbarsky): Try to enable this once rules_go doesn't build the builder binary in race mode.
         # run: bazel test --@rules_go//go/config:race --@rules_go//go/config:pure=false //...
