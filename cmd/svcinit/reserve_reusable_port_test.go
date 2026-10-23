@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"net"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
+
+	"rules_itest/svclib"
 )
 
 func TestReusablePortReservation(t *testing.T) {
@@ -25,10 +28,7 @@ func TestReusablePortReservation(t *testing.T) {
 		Control: func(network, address string, conn syscall.RawConn) error {
 			var setSockoptErr error
 			err := conn.Control(func(fd uintptr) {
-				setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
-					Onoff:  1,
-					Linger: 0,
-				})
+				setSockoptErr = setSockoptsForPortAssignment(fd, true)
 			})
 			if err != nil {
 				return err
@@ -68,5 +68,51 @@ func TestReusablePortReservation(t *testing.T) {
 		result.conn.Close()
 	case <-time.After(time.Second):
 		t.Fatal("connection was not accepted by the service listener")
+	}
+
+	t.Setenv("ASSIGNED_PORTS", "")
+	for _, reusable := range []bool{false, true} {
+		ports, reserved, err := assignPorts(map[string]svclib.ServiceSpec{
+			"service": {NamedPorts: map[string]string{"occupied": port}, SoReuseportAware: reusable},
+		})
+		if err := closePorts(reserved); err != nil {
+			t.Error(err)
+		}
+		if err == nil {
+			t.Errorf("reuse-aware=%t: assigned occupied %s: %v", reusable, listener.Addr(), ports)
+		}
+	}
+}
+
+func TestFailedAssignmentReleasesPorts(t *testing.T) {
+	probe, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().(*net.TCPAddr)
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(address.Port)
+	t.Setenv("ASSIGNED_PORTS", "")
+	for _, reusable := range []bool{false, true} {
+		_, reserved, err := assignPorts(map[string]svclib.ServiceSpec{
+			"service": {NamedPorts: map[string]string{"first": port, "second": port}, SoReuseportAware: reusable},
+		})
+		t.Cleanup(func() {
+			if err := closePorts(reserved); err != nil {
+				t.Error(err)
+			}
+		})
+		if err == nil {
+			t.Fatalf("reuse-aware=%t: assigned the same port twice", reusable)
+		}
+		listener, err := net.Listen("tcp4", address.String())
+		if err != nil {
+			t.Fatalf("reuse-aware=%t: failed assignment did not release %s: %v", reusable, address, err)
+		}
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
