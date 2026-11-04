@@ -1,0 +1,40 @@
+load("@rules_go//go:def.bzl", "go_binary")
+load("@rules_itest//:itest.bzl", "itest_service_group", "itest_task")
+
+go_binary(
+    name = "print_args",
+    srcs = ["main.go"],
+)
+
+itest_task(
+    name = "migrate",
+    args = ["--base-flag=migrate-default"],
+    env = {"TARGET_ARGS_TASK_NAME": "//target_args:migrate"},
+    exe = ":print_args",
+)
+
+alias(
+    name = "migrate_alias",
+    actual = ":migrate",
+)
+
+itest_task(
+    name = "seed",
+    args = ["--base-flag=seed-default"],
+    env = {"TARGET_ARGS_TASK_NAME": "//target_args:seed"},
+    exe = ":print_args",
+)
+
+alias(
+    name = "seed_alias",
+    actual = ":seed",
+)
+
+itest_service_group(
+    name = "workflow",
+    hygienic = False,
+    services = [
+        ":migrate_alias",
+        ":seed_alias",
+    ],
+)
