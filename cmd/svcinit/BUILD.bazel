@@ -4,6 +4,7 @@ go_library(
     name = "svcinit_lib",
     srcs = [
         "main.go",
+        "port_names.go",
         "reserve_reusable_port_unix.go",
         "reserve_reusable_port_windows.go",
         "set_sockopts_for_port_assignment_unix.go",

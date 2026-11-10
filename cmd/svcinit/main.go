@@ -508,26 +508,7 @@ func assignPorts(
 		return nil, nil, nil, err
 	}
 
-	for label, spec := range serviceSpecs {
-		for portName, aliasedTo := range spec.PortAliases {
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
-			}
-
-			ports.Set(qualifiedPortName, ports[aliasedTo])
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				ports.Set(qualifiedPortName, ports[aliasedTo])
-			}
-		}
-	}
+	assignPortAliases(ports, serviceSpecs)
 
 	// Complete hack - we have observed that the ports may not be ready immediately after closing, even with SO_LINGER set to 0.
 	// Give the kernel a bit of time to figure out what we've done.
