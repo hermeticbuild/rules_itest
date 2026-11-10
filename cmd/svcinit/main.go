@@ -474,20 +474,6 @@ func assignPorts(
 
 		ports.Set(qualifiedPortName, port)
 
-		{
-			// TODO(zbarsky): Clean this up after April 2026
-			qualifiedPortName := request.label
-			if request.name != "" {
-				qualifiedPortName += ":" + request.name
-			}
-
-			if !terseOutput {
-				log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-			}
-
-			ports.Set(qualifiedPortName, port)
-		}
-
 		if request.reusable {
 			reservedPorts[request.label] = append(reservedPorts[request.label], reservedPort)
 		} else {

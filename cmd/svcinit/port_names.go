@@ -11,16 +11,6 @@ func assignPortAliases(ports svclib.Ports, serviceSpecs map[string]svclib.Servic
 			}
 
 			ports.Set(qualifiedPortName, ports[aliasedTo])
-
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				ports.Set(qualifiedPortName, ports[aliasedTo])
-			}
 		}
 	}
 }

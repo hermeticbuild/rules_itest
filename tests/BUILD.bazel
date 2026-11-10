@@ -89,7 +89,7 @@ itest_service(
     ],
     autoassign_port = True,
     exe = "//go_service",
-    http_health_check_address = "http://127.0.0.1:$${@@//:named_port:http_port}",
+    http_health_check_address = "http://127.0.0.1:$${@@//:named_port.http_port}",
     named_ports = ["http_port"],
 )
 
@@ -123,7 +123,7 @@ itest_service(
     autoassign_port = True,
     env = {"foo": "bar"},
     exe = "//go_service",
-    http_health_check_address = "http://127.0.0.1:$${@@//:speedy_service2:port}",
+    http_health_check_address = "http://127.0.0.1:$${@@//:speedy_service2.port}",
     tags = ["manual"],
 )
 

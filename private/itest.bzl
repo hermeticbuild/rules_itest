@@ -263,7 +263,7 @@ _itest_service_attrs = _itest_binary_attrs | {
     "port": attr.label(doc = "Internal"),
     "named_ports": attr.label_keyed_string_dict(
         doc = """For each element of the list, the service manager will pick a free port and assign it to the service.
-        The port's fully-qualified name is the service's fully-qualified label and the port name, separated by a colon.
+        The port's fully-qualified name is the service's fully-qualified label and the port name, separated by a dot.
         For example, a port assigned with `named_ports = ["http_port"]` will be assigned a fully-qualified name of `@@//label/for:service.http_port`.
 
         Named ports are accessible through the service-port mapping. For more details, see `autoassign_port`.""",
@@ -305,8 +305,8 @@ _itest_service_attrs = _itest_binary_attrs | {
     ),
     "http_health_check_address": attr.string(
         doc = """If set, the service manager will send an HTTP request to this address to check if the service came up in a healthy state.
-        This check will be retried until it returns a 200 HTTP code. When used in conjunction with autoassigned ports, `$${@@//label/for:service:port_name}` can be used in the address.
-        Example: `http_health_check_address = "http://127.0.0.1:$${@@//label/for:service:port_name}",`""",
+        This check will be retried until it returns a 200 HTTP code. When used in conjunction with autoassigned ports, `$${@@//label/for:service.port_name}` can be used in the address.
+        Example: `http_health_check_address = "http://127.0.0.1:$${@@//label/for:service.port_name}",`""",
     ),
     "shutdown_signal": attr.string(
         default = "SIGTERM",
