@@ -390,9 +390,7 @@ func servicePortRequests(serviceSpecs map[string]svclib.ServiceSpec) []portReque
 			add("", spec.Port)
 		}
 		for name, port := range spec.NamedPorts {
-			if name != "" || !spec.AutoassignPort {
-				add(name, port)
-			}
+			add(name, port)
 		}
 	}
 	return append(fixed, dynamic...)
@@ -420,6 +418,10 @@ func assignPorts(
 
 	// Keep every fixed port reserved before letting the OS choose any dynamic port.
 	for _, request := range servicePortRequests(serviceSpecs) {
+		name := qualifiedPortName(request.label, request.name)
+		if _, exists := ports[name]; exists {
+			return nil, nil, nil, fmt.Errorf("duplicate port name %q", name)
+		}
 		port := request.port
 		var reservedPort io.Closer
 		var err error
@@ -463,22 +465,21 @@ func assignPorts(
 			reservedPort = listener
 		}
 
-		qualifiedPortName := request.label
-		if request.name != "" {
-			qualifiedPortName += "." + request.name
-		}
-
 		if !terseOutput {
-			log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
+			log.Printf("Assigning port %s to %s\n", port, name)
 		}
 
-		ports.Set(qualifiedPortName, port)
+		ports[name] = port
 
 		if request.reusable {
 			reservedPorts[request.label] = append(reservedPorts[request.label], reservedPort)
 		} else {
 			toClose = append(toClose, reservedPort)
 		}
+	}
+
+	if err := assignPortAliases(ports, serviceSpecs); err != nil {
+		return nil, nil, nil, err
 	}
 
 	// The control listener must be opened while all service ports are still held.
@@ -493,8 +494,6 @@ func assignPorts(
 	if err != nil {
 		return nil, nil, nil, err
 	}
-
-	assignPortAliases(ports, serviceSpecs)
 
 	// Complete hack - we have observed that the ports may not be ready immediately after closing, even with SO_LINGER set to 0.
 	// Give the kernel a bit of time to figure out what we've done.

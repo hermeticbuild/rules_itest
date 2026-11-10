@@ -16,7 +16,7 @@ func TestServicePortRequestsFixedBeforeDynamic(t *testing.T) {
 		"alpha": {
 			AutoassignPort: true,
 			Port:           "+",
-			NamedPorts:     map[string]string{"": "34567", "fixed": "12345"},
+			NamedPorts:     map[string]string{"fixed": "12345"},
 		},
 		"beta": {
 			AutoassignPort:   true,

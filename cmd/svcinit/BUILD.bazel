@@ -63,6 +63,7 @@ go_test(
     name = "svcinit_test",
     srcs = [
         "port_allocation_test.go",
+        "port_names_test.go",
         "reserve_reusable_port_test.go",
     ],
     embed = [":svcinit_lib"],
