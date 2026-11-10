@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"math"
 	"net"
 	"os"
@@ -120,12 +119,7 @@ func main() {
 	unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
 	must(err)
 
-	// Make sure we grab the svcctl port before we assign test ports,
-	// otherwise we might steal an assigned port by accident.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	must(err)
-
-	ports, reservedPorts, err := assignPorts(unversionedSpecs)
+	ports, reservedPorts, listener, err := assignPorts(unversionedSpecs, "127.0.0.1:0")
 	must(err)
 	defer closeReservedPorts(reservedPorts)
 
@@ -373,70 +367,118 @@ func readServiceSpecs(
 	return serviceSpecs, err
 }
 
+type portRequest struct {
+	label    string
+	name     string
+	port     string
+	reusable bool
+}
+
+func servicePortRequests(serviceSpecs map[string]svclib.ServiceSpec) []portRequest {
+	var fixed, dynamic []portRequest
+	for label, spec := range serviceSpecs {
+		add := func(name, port string) {
+			request := portRequest{label: label, name: name, port: port, reusable: spec.SoReuseportAware}
+			// Match net.Listen's interpretation of all spellings of port zero.
+			if n, err := net.LookupPort("tcp", port); err == nil && n == 0 {
+				dynamic = append(dynamic, request)
+			} else {
+				fixed = append(fixed, request)
+			}
+		}
+		if spec.AutoassignPort {
+			add("", spec.Port)
+		}
+		for name, port := range spec.NamedPorts {
+			if name != "" || !spec.AutoassignPort {
+				add(name, port)
+			}
+		}
+	}
+	return append(fixed, dynamic...)
+}
+
 func assignPorts(
 	serviceSpecs map[string]svclib.ServiceSpec,
+	svcctlAddress string,
 ) (
-	svclib.Ports, map[string][]io.Closer, error,
+	_ svclib.Ports, _ map[string][]io.Closer, _ net.Listener, resultErr error,
 ) {
 	var toClose []io.Closer
 	reservedPorts := map[string][]io.Closer{}
+	var controlListener net.Listener
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, closePorts(toClose))
+			closeReservedPorts(reservedPorts)
+			if controlListener != nil {
+				resultErr = errors.Join(resultErr, controlListener.Close())
+			}
+		}
+	}()
 	ports := svclib.Ports{}
 
-	for label, spec := range serviceSpecs {
-		namedPorts := maps.Clone(spec.NamedPorts)
-		if spec.AutoassignPort {
-			namedPorts[""] = spec.Port
-		}
-
-		// Note, this can cause collisions. So be careful!
-		// To avoid port collisions, set so_reuseport_aware on the service definition
-		// and use SO_REUSEPORT on Unix or SO_REUSEADDR on Windows in your services.
-		for portName, port := range namedPorts {
-			var reservedPort io.Closer
-			var err error
-			if spec.SoReuseportAware {
-				requestedPort, parseErr := strconv.Atoi(port)
-				if parseErr != nil || requestedPort < 0 || requestedPort > 65535 {
-					return nil, nil, fmt.Errorf("invalid port %q for %s", port, label)
-				}
-				reservedPort, port, err = reserveReusablePort(requestedPort)
-				if err != nil {
-					return nil, nil, err
-				}
-			} else {
-				// We do a bit of a dance here to set SO_LINGER to 0. For details, see
-				// https://stackoverflow.com/questions/71975992/what-really-is-the-linger-time-that-can-be-set-with-so-linger-on-sockets
-				lc := net.ListenConfig{
-					Control: func(network, address string, conn syscall.RawConn) error {
-						var setSockoptErr error
-						err := conn.Control(func(fd uintptr) {
-							setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
-								Onoff:  1,
-								Linger: 0,
-							})
+	// Keep every fixed port reserved before letting the OS choose any dynamic port.
+	for _, request := range servicePortRequests(serviceSpecs) {
+		port := request.port
+		var reservedPort io.Closer
+		var err error
+		if request.reusable {
+			requestedPort, parseErr := strconv.Atoi(port)
+			if parseErr != nil || requestedPort < 0 || requestedPort > 65535 {
+				return nil, nil, nil, fmt.Errorf("invalid port %q for %s", port, request.label)
+			}
+			reservedPort, port, err = reserveReusablePort(requestedPort)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		} else {
+			// We do a bit of a dance here to set SO_LINGER to 0. For details, see
+			// https://stackoverflow.com/questions/71975992/what-really-is-the-linger-time-that-can-be-set-with-so-linger-on-sockets
+			lc := net.ListenConfig{
+				Control: func(network, address string, conn syscall.RawConn) error {
+					var setSockoptErr error
+					err := conn.Control(func(fd uintptr) {
+						setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
+							Onoff:  1,
+							Linger: 0,
 						})
-						if err != nil {
-							return err
-						}
-						return setSockoptErr
-					},
-				}
-
-				listener, listenErr := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
-				if listenErr != nil {
-					return nil, nil, listenErr
-				}
-				_, port, err = net.SplitHostPort(listener.Addr().String())
-				if err != nil {
-					listener.Close()
-					return nil, nil, err
-				}
-				reservedPort = listener
+					})
+					if err != nil {
+						return err
+					}
+					return setSockoptErr
+				},
 			}
 
-			qualifiedPortName := label
-			if portName != "" {
-				qualifiedPortName += "." + portName
+			listener, listenErr := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
+			if listenErr != nil {
+				return nil, nil, nil, listenErr
+			}
+			_, port, err = net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				listener.Close()
+				return nil, nil, nil, err
+			}
+			reservedPort = listener
+		}
+
+		qualifiedPortName := request.label
+		if request.name != "" {
+			qualifiedPortName += "." + request.name
+		}
+
+		if !terseOutput {
+			log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
+		}
+
+		ports.Set(qualifiedPortName, port)
+
+		{
+			// TODO(zbarsky): Clean this up after April 2026
+			qualifiedPortName := request.label
+			if request.name != "" {
+				qualifiedPortName += ":" + request.name
 			}
 
 			if !terseOutput {
@@ -444,34 +486,26 @@ func assignPorts(
 			}
 
 			ports.Set(qualifiedPortName, port)
+		}
 
-			{
-				// TODO(zbarsky): Clean this up after April 2026
-				qualifiedPortName := label
-				if portName != "" {
-					qualifiedPortName += ":" + portName
-				}
-
-				if !terseOutput {
-					log.Printf("Assigning port %s to %s\n", port, qualifiedPortName)
-				}
-
-				ports.Set(qualifiedPortName, port)
-			}
-
-			if !spec.SoReuseportAware {
-				toClose = append(toClose, reservedPort)
-			} else {
-				reservedPorts[label] = append(reservedPorts[label], reservedPort)
-			}
+		if request.reusable {
+			reservedPorts[request.label] = append(reservedPorts[request.label], reservedPort)
+		} else {
+			toClose = append(toClose, reservedPort)
 		}
 	}
 
-	for _, reservedPort := range toClose {
-		err := reservedPort.Close()
-		if err != nil {
-			return nil, nil, err
-		}
+	// The control listener must be opened while all service ports are still held.
+	controlListener, err := net.Listen("tcp", svcctlAddress)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("listen for svcctl: %w", err)
+	}
+	// Ordinary services need their ports released before they can bind, which
+	// leaves a race with other processes. Reusable reservations remain held.
+	err = closePorts(toClose)
+	toClose = nil
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	for label, spec := range serviceSpecs {
@@ -501,10 +535,18 @@ func assignPorts(
 
 	serializedPorts, err := ports.Marshal()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	os.Setenv("ASSIGNED_PORTS", string(serializedPorts))
-	return ports, reservedPorts, nil
+	return ports, reservedPorts, controlListener, nil
+}
+
+func closePorts(ports []io.Closer) error {
+	var err error
+	for _, port := range ports {
+		err = errors.Join(err, port.Close())
+	}
+	return err
 }
 
 func closeReservedPorts(reservedPorts map[string][]io.Closer) {
