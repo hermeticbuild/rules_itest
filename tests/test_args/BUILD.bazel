@@ -1,5 +1,19 @@
 load("@rules_go//go:def.bzl", "go_test")
-load("@rules_itest//:itest.bzl", "service_test")
+load("@rules_itest//:itest.bzl", "itest_service_group", "named_port", "named_port_alias", "port", "port_alias", "service_test")
+
+itest_service_group(
+    name = "test_args",
+    hygienic = False,
+    port_aliases = {"http": port_alias("//:autoassigned")},
+    services = ["//:autoassigned"],
+)
+
+itest_service_group(
+    name = "outer",
+    hygienic = False,
+    port_aliases = {"": named_port_alias("//test_args", "http")},
+    services = [":test_args"],
+)
 
 go_test(
     name = "_args_test",
@@ -9,10 +23,11 @@ go_test(
 
 service_test(
     name = "args_test",
-    services = ["//:autoassigned"],
+    services = [":outer"],
     test = ":_args_test",
     args = [
         "--test-arg=hello",
-        "--test-port=$${@@//:autoassigned}",
+        "--test-port=" + port(":outer"),
+        "--named-port=" + named_port("//test_args", "http"),
     ],
 )
