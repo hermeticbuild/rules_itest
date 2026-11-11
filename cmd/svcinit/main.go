@@ -17,7 +17,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -26,6 +25,7 @@ import (
 
 	"rules_itest/logger"
 	"rules_itest/runner"
+	"rules_itest/runner/topological"
 	"rules_itest/svcctl"
 	"rules_itest/svclib"
 )
@@ -156,12 +156,12 @@ func main() {
 	r, err := runner.New(ctx, serviceSpecs)
 	must(err)
 
-	mustStopAllForExit := sync.OnceValue(func() map[string]*os.ProcessState {
+	mustStopAllForExit := func() map[string]*os.ProcessState {
 		states, err := r.StopAll()
 		cancelFunc()
 		must(err)
 		return states
-	})
+	}
 
 	servicesErrCh := make(chan error, len(unversionedSpecs))
 
@@ -198,181 +198,68 @@ func main() {
 	}
 	must(err)
 
-	// API is                 NewWriter(output io.Writer, minwidth, tabwidth, padding int, padchar byte, flags uint) *Writer
-	reportWriter := tabwriter.NewWriter(os.Stdout, 0, 8, 8, ' ', 0)
-	buf := bytes.NewBuffer(nil)
-
+Runs:
 	for {
-		buf.WriteString("\nTarget\tCritical Path Contribution\n")
-		for _, task := range criticalPath {
-			buf.WriteString(fmt.Sprintf("%s\t%s\n", task.Key(), task.Duration()))
-		}
-		_, err := reportWriter.Write(buf.Bytes())
-		must(err)
-		buf.Reset()
-		err = reportWriter.Flush()
-		must(err)
-
-		var testCmd *exec.Cmd
-		testCtx, testCancel := context.WithCancel(ctx)
-		testErrCh := make(chan error, 1)
+		reportCriticalPath(criticalPath)
+		var test testRun
 		if testLabel != "" {
-			// Bazel's args attribute converts $$ to $, so args arrive with
-			// single-$ placeholders (e.g. ${@@//:svc}) unlike env/spec files
-			// which preserve the literal $$ since they're read from JSON.
-			argReplacements := buildReplacements(ports, "${")
-			testArgs := make([]string, len(os.Args[1:]))
-			for i, arg := range os.Args[1:] {
-				testArgs[i] = replaceAll(arg, argReplacements)
-			}
-			testPath, err := runfiles.Rlocation(os.Getenv("SVCINIT_TEST_RLOCATION_PATH"))
-			must(err)
-
-			testEnv, err := buildTestEnv(ports)
-			must(err)
-
-			fmt.Println("")
-			if !terseOutput {
-				log.Printf("Executing test: %s, %s\n", testPath, strings.Join(testArgs, " "))
-			}
-			testStartTime := time.Now()
-
-			testCmd = exec.CommandContext(testCtx, testPath, testArgs...)
-			testCmd.Env = testEnv
-
-			// Adjust remaining timeout to account for service startup.
-			timeout := os.Getenv("TEST_TIMEOUT")
-			if timeout != "" {
-				timeoutVal, err := strconv.Atoi(timeout)
-				if err != nil {
-					fmt.Println(err)
-				} else {
-					timeoutVal -= int(math.Ceil(testStartTime.Sub(start).Seconds()))
-					testCmd.Env = append(testCmd.Env, "TEST_TIMEOUT="+strconv.Itoa(timeoutVal))
-				}
-			}
-
-			testCmd.Stdout = os.Stdout
-			testCmd.Stderr = os.Stderr
-
-			if err := testCmd.Start(); err != nil {
-				panic(err)
-			}
-
-			go func() {
-				testErrCh <- testCmd.Wait()
-
-				testDuration := time.Since(testStartTime)
-				log.Printf("Test duration: %s\n", testDuration)
-			}()
+			test = startTest(ctx, ports, start)
+		}
+		fmt.Println()
+		if shouldHotReload && !enablePerServiceReload {
+			warnNoServiceReload(testLabel)
 		}
 
-		fmt.Println()
-
-		if shouldHotReload && !enablePerServiceReload {
-			fmt.Println()
-			fmt.Println("###########################################################################################")
-			fmt.Println("  Detected that you are running under ibazel, but do not have per-service-reload enabled.")
-			fmt.Println("  In this configuration, services will not be restarted when their code changes.")
-			fmt.Println("  If this was unintentional, you can retry with per-service-reload enabled:")
-			fmt.Println("")
-			fmt.Printf("  `bazel run --@rules_itest//:enable_per_service_reload %s`\n", testLabel)
-			fmt.Println("###########################################################################################")
-			fmt.Println()
-			fmt.Println()
+		if isOneShot {
+			err := waitOneShot(ctx, test.done, servicesErrCh)
+			if errors.Is(err, context.Canceled) {
+				break Runs
+			}
+			if err != nil {
+				log.Print(err)
+				mustStopAllForExit()
+				os.Exit(1)
+			}
+			states := mustStopAllForExit()
+			reportOneShot(testLabel, test, states)
+			return
 		}
 
 		select {
 		case <-ctx.Done():
-			log.Println("Shutting down services.")
-			mustStopAllForExit()
-			log.Println("Cleaning up.")
-			return
+			break Runs
 		case err := <-buildReadErr:
-			if testLabel != "" {
-				testCancel()
-				<-testErrCh
+			if test.done != nil {
+				test.cancel()
+				<-test.done
 			}
 			mustStopAllForExit()
 			panic(fmt.Errorf("reading iBazel notifications: %w", err))
-		case ibazelCmd := <-builds:
-			os.Stderr.WriteString(ibazelCmd)
-
-			// Restart any services as needed.
+		case line := <-builds:
+			os.Stderr.WriteString(line)
 			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
 			must(err)
-
 			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
 			must(err)
-
-			testCancel()
-
-			// This is a brittle way of draining a channel in a nonblocking way,
-			// consider instead signalling cancellation of the services with a
-			// context, letting them close the channel, and using a waitgroup to
-			// wait for them to exit.
-			// See: https://github.com/hermeticbuild/rules_itest/issues/72
-		Drain:
-			for {
-				select {
-				case crashErr := <-servicesErrCh:
-					log.Printf("Discarding pending service error before reload: %v", crashErr)
-				default:
-					break Drain
-				}
+			if test.done != nil {
+				test.cancel()
 			}
-
-			criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(ibazelCmd))
+			discardServiceErrors(servicesErrCh)
+			criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(line))
 			must(err)
-
 			continue
-
-		case testErr := <-testErrCh:
+		case testErr := <-test.done:
 			if testErr != nil {
 				log.Printf("Encountered error during test run: %s\n", testErr)
-				if isOneShot {
-					mustStopAllForExit()
-					os.Exit(1)
-				}
 			}
 		case serviceErr := <-servicesErrCh:
 			log.Print(serviceErr)
-			if isOneShot {
-				mustStopAllForExit()
-				log.Fatal("Service exited uncleanly, marking test as failed.\n\n")
-			}
 		}
-
-		if isOneShot {
-			buf.WriteString("Target\tUser Time\tSystem Time\n")
-			states := mustStopAllForExit()
-			for label, state := range states {
-				buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
-					label, state.UserTime(), state.SystemTime()))
-			}
-		} else {
-			buf.WriteString("Target\tStartup Time\n")
-			durations := r.GetStartDurations()
-			for label, duration := range durations {
-				buf.WriteString(fmt.Sprintf("%s\t%s\n", label, duration))
-			}
-		}
-
-		if testLabel != "" {
-			buf.WriteString(fmt.Sprintf("%s\t%s\t%s\n",
-				testLabel, testCmd.ProcessState.UserTime(), testCmd.ProcessState.SystemTime()))
-		}
-		buf.WriteRune('\n')
-		_, err = reportWriter.Write(buf.Bytes())
-		must(err)
-		buf.Reset()
-		err = reportWriter.Flush()
-		must(err)
-
-		if isOneShot {
-			break
-		}
+		reportStartupTimes(testLabel, test, r.GetStartDurations())
 	}
+	log.Println("Shutting down services.")
+	mustStopAllForExit()
+	log.Println("Cleaning up.")
 }
 
 // scanLinesKeepNewline returns each line with its delimiter and rejects a partial final line.
@@ -384,6 +271,144 @@ func scanLinesKeepNewline(data []byte, atEOF bool) (advance int, token []byte, e
 		return 0, nil, io.ErrUnexpectedEOF
 	}
 	return 0, nil, nil
+}
+
+// A zero testRun has no child; its nil done channel is disabled in a select.
+type testRun struct {
+	cmd    *exec.Cmd
+	cancel context.CancelFunc
+	done   <-chan error
+}
+
+func startTest(ctx context.Context, ports svclib.Ports, start time.Time) testRun {
+	// Bazel's args attribute converts $ to $, so args arrive with
+	// single-$ placeholders (e.g. ${@@//:svc}) unlike env/spec files
+	// which preserve the literal $ since they're read from JSON.
+	argReplacements := buildReplacements(ports, "${")
+	testArgs := make([]string, len(os.Args[1:]))
+	for i, arg := range os.Args[1:] {
+		testArgs[i] = replaceAll(arg, argReplacements)
+	}
+	testPath, err := runfiles.Rlocation(os.Getenv("SVCINIT_TEST_RLOCATION_PATH"))
+	must(err)
+
+	testEnv, err := buildTestEnv(ports)
+	must(err)
+
+	fmt.Println("")
+	if !terseOutput {
+		log.Printf("Executing test: %s, %s\n", testPath, strings.Join(testArgs, " "))
+	}
+	testStartTime := time.Now()
+
+	testCtx, cancel := context.WithCancel(ctx)
+	testCmd := exec.CommandContext(testCtx, testPath, testArgs...)
+	testCmd.Env = testEnv
+
+	// Adjust remaining timeout to account for service startup.
+	timeout := os.Getenv("TEST_TIMEOUT")
+	if timeout != "" {
+		timeoutVal, err := strconv.Atoi(timeout)
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			timeoutVal -= int(math.Ceil(testStartTime.Sub(start).Seconds()))
+			testCmd.Env = append(testCmd.Env, "TEST_TIMEOUT="+strconv.Itoa(timeoutVal))
+		}
+	}
+
+	testCmd.Stdout = os.Stdout
+	testCmd.Stderr = os.Stderr
+
+	if err := testCmd.Start(); err != nil {
+		panic(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		err := testCmd.Wait()
+		cancel()
+		done <- err
+		log.Printf("Test duration: %s\n", time.Since(testStartTime))
+	}()
+	return testRun{cmd: testCmd, cancel: cancel, done: done}
+}
+
+func waitOneShot(ctx context.Context, testDone, serviceErrors <-chan error) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-serviceErrors:
+		return fmt.Errorf("service failed: %w", err)
+	case err := <-testDone:
+		return err
+	}
+}
+
+func reportTable() *tabwriter.Writer {
+	return tabwriter.NewWriter(os.Stdout, 0, 8, 8, ' ', 0)
+}
+
+func reportCriticalPath(tasks []topological.Task) {
+	w := reportTable()
+	fmt.Fprintln(w, "\nTarget\tCritical Path Contribution")
+	for _, task := range tasks {
+		fmt.Fprintf(w, "%s\t%s\n", task.Key(), task.Duration())
+	}
+	must(w.Flush())
+}
+
+func reportOneShot(label string, test testRun, services map[string]*os.ProcessState) {
+	w := reportTable()
+	fmt.Fprintln(w, "Target\tUser Time\tSystem Time")
+	for label, state := range services {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", label, state.UserTime(), state.SystemTime())
+	}
+	test.finishReport(w, label)
+}
+
+func reportStartupTimes(label string, test testRun, services map[string]time.Duration) {
+	w := reportTable()
+	fmt.Fprintln(w, "Target\tStartup Time")
+	for label, duration := range services {
+		fmt.Fprintf(w, "%s\t%s\n", label, duration)
+	}
+	test.finishReport(w, label)
+}
+
+func (test testRun) finishReport(w *tabwriter.Writer, label string) {
+	if test.cmd != nil {
+		state := test.cmd.ProcessState
+		fmt.Fprintf(w, "%s\t%s\t%s\n", label, state.UserTime(), state.SystemTime())
+	}
+	fmt.Fprintln(w)
+	must(w.Flush())
+}
+
+func warnNoServiceReload(testLabel string) {
+	fmt.Println()
+	fmt.Println("###########################################################################################")
+	fmt.Println("  Detected that you are running under ibazel, but do not have per-service-reload enabled.")
+	fmt.Println("  In this configuration, services will not be restarted when their code changes.")
+	fmt.Println("  If this was unintentional, you can retry with per-service-reload enabled:")
+	fmt.Println("")
+	fmt.Printf("  `bazel run --@rules_itest//:enable_per_service_reload %s`\n", testLabel)
+	fmt.Println("###########################################################################################")
+	fmt.Println()
+	fmt.Println()
+}
+
+func discardServiceErrors(servicesErrCh <-chan error) {
+	// Discard errors already queued by services from the previous build.
+	// See https://github.com/hermeticbuild/rules_itest/issues/72.
+	for {
+		select {
+		case err := <-servicesErrCh:
+			log.Printf("Discarding pending service error before reload: %v", err)
+		default:
+			return
+		}
+	}
 }
 
 func readServiceSpecs(

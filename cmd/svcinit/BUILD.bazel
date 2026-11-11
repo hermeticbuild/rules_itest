@@ -15,6 +15,7 @@ go_library(
     deps = [
         "//logger",
         "//runner",
+        "//runner/topological",
         "//svcctl",
         "//svclib",
         "@rules_go//go/runfiles",
