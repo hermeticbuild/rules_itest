@@ -1,9 +1,14 @@
 load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//go:def.bzl", "go_binary")
 load("@rules_itest//:itest.bzl", "itest_service", "itest_service_group", "named_port", "port")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["not.sh"])
+go_binary(
+    name = "must_fail",
+    srcs = ["must_fail.go"],
+    deps = ["@rules_go//go/runfiles"],
+)
 
 gazelle(name = "gazelle")
 

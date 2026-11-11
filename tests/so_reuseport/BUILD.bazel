@@ -1,7 +1,7 @@
 load("@aspect_rules_js//js:defs.bzl", "js_test")
 load("@rules_go//go:def.bzl", "go_test")
 load("@rules_itest//:itest.bzl", "itest_service", "service_test")
-load("//:must_fail.bzl", "must_fail")
+load("//:must_fail.bzl", "must_fail_test")
 
 itest_service(
     name = "reuseport_service",
@@ -24,6 +24,7 @@ itest_service(
     args = [
         "-port",
         "$${PORT}",
+        "-so-reuseport=false",
     ],
     autoassign_port = True,
     exe = "//go_service",
@@ -33,10 +34,9 @@ itest_service(
     tags = ["manual"],
 )
 
-# TODO(zbarsky): this rule is busted, it isn't actually working correctly.
-# May need to bust out real bazel integration tests?
-must_fail(
+must_fail_test(
     name = "no_reuseport_service_hygiene_test",
+    expected = "listen with -so-reuseport=false: listen tcp",
     test = "_no_reuseport_service_hygiene_test",
 )
 

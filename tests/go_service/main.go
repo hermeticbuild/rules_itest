@@ -5,7 +5,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
@@ -17,6 +19,7 @@ func main() {
 	sleepTime := flag.Duration("sleep-time", 0, "How long to sleep before binding the port")
 	busyWaitTime := flag.Duration("busy-time", 0, "How long to busy-wait before binding the port")
 	dieAfter := flag.Duration("die-after", 0, "How long to wait before self-destructing")
+	ignoreSIGTERM := flag.Bool("ignore-sigterm", false, "Ignore SIGTERM to force a shutdown timeout")
 	fileToOpen := flag.String("file-to-open", "", "A file to open to check runfiles")
 	soReuseport := flag.Bool(
 		"so-reuseport",
@@ -27,6 +30,9 @@ func main() {
 
 	flag.Parse()
 
+	if *ignoreSIGTERM {
+		signal.Ignore(syscall.SIGTERM)
+	}
 	if *dieAfter != 0 {
 		go func() {
 			<-time.After(*dieAfter)

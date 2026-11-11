@@ -1,7 +1,7 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 load("@rules_itest//:itest.bzl", "itest_service", "service_test")
-load("//:must_fail.bzl", "must_fail")
+load("//:must_fail.bzl", "must_fail_test")
 
 bool_flag(
     name = "enforce_graceful_shutdown",
@@ -17,14 +17,15 @@ js_binary(
 
 itest_service(
     name = "service_timeout_error",
-    args = ["$${PORT}"],
+    args = [
+        "-port",
+        "$${PORT}",
+        "-ignore-sigterm",
+    ],
     autoassign_port = True,
     enforce_graceful_shutdown = ":enforce_graceful_shutdown",
-    env = {
-        "SHUTDOWN_WAIT_SECONDS": "1000",
-    },
-    exe = ":server",
-    http_health_check_address = "http://localhost:$${PORT}",
+    exe = "//go_service",
+    http_health_check_address = "http://127.0.0.1:$${PORT}",
     tags = ["manual"],
 )
 
@@ -80,7 +81,13 @@ service_test(
     test = "@rules_itest//:exit0_test",
 )
 
-must_fail(
+must_fail_test(
     name = "shutdown_test_failure",
+    expected = "did not handle SIGTERM within",
+    # The Windows runner kills the process without delivering SIGTERM.
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     test = "timeout_shutdown_test",
 )

@@ -33,7 +33,7 @@ func serve(port string, soReuseport bool) {
 
 	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("listen with -so-reuseport=%t: %v", soReuseport, err)
 	}
 	http.Serve(l, nil)
 }

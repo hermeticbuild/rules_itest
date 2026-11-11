@@ -1,6 +1,6 @@
-load("@rules_go//go:def.bzl", "go_test")
+load("@rules_go//go:def.bzl", "go_binary")
 load("@rules_itest//:itest.bzl", "itest_service", "service_test")
-load("//:must_fail.bzl", "must_fail")
+load("//:must_fail.bzl", "must_fail_test")
 
 itest_service(
     name = "crashing_service",
@@ -16,8 +16,9 @@ itest_service(
     hygienic = False,
 )
 
-must_fail(
+must_fail_test(
     name = "crash_test",
+    expected = "exited with error: exit status 1",
     test = "_crash_test",
 )
 
@@ -27,11 +28,11 @@ service_test(
         ":crashing_service",
     ],
     tags = ["manual"],
-    test = ":crashing_service_test",
+    test = ":wait",
 )
 
-go_test(
-    name = "crashing_service_test",
-    srcs = ["crash_test.go"],
+go_binary(
+    name = "wait",
+    srcs = ["wait.go"],
     tags = ["manual"],
 )
