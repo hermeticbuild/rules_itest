@@ -203,6 +203,8 @@ def _itest_service_impl(ctx):
     if ctx.attr.health_check_timeout:
         _validate_duration("health_check_timeout", ctx.attr.health_check_timeout)
 
+    _validate_duration("health_check_wait_delay", ctx.attr.health_check_wait_delay)
+
     if ctx.attr.so_reuseport_aware and not (ctx.attr.autoassign_port or ctx.attr.named_ports):
         fail("SO_REUSEPORT awareness only makes sense when using port autoassignment")
 
@@ -223,6 +225,7 @@ def _itest_service_impl(ctx):
         "expected_start_duration": ctx.attr.expected_start_duration,
         "health_check_interval": ctx.attr.health_check_interval,
         "health_check_timeout": ctx.attr.health_check_timeout,
+        "health_check_wait_delay": ctx.attr.health_check_wait_delay,
         "shutdown_signal": ctx.attr.shutdown_signal,
         "shutdown_timeout": shutdown_timeout,
         "enforce_graceful_shutdown": bool(ctx.attr.enforce_graceful_shutdown[BuildSettingInfo].value),
@@ -298,6 +301,10 @@ _itest_service_attrs = _itest_binary_attrs | {
     "health_check_timeout": attr.string(
         default = "",
         doc = "The timeout to wait for the health check. The syntax is based on common time duration with a number, followed by the time unit. For example, `200ms`, `1s`, `2m`, `3h`, `4d`. If empty or not set, the health check will not have a timeout.",
+    ),
+    "health_check_wait_delay": attr.string(
+        default = "50ms",
+        doc = "How long to wait for the `health_check` binary's stdout and stderr to close after it exits. A background process started by the health check can inherit these pipes and keep them open; once the delay elapses, the pipes are closed and the exit code of the health check decides the result. The syntax is based on common time duration with a number, followed by the time unit. For example, `200ms`, `1s`, `2m`, `3h`, `4d`. `0s` waits until the pipes are closed.",
     ),
     "hot_reloadable": attr.bool(
         doc = """If set to True, the service manager will propagate ibazel's reload notification over stdin instead of restarting the service.
