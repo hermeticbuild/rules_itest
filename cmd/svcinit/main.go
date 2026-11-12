@@ -211,7 +211,7 @@ Runs:
 		}
 
 		if isOneShot {
-			err := waitOneShot(ctx, test.done, servicesErrCh)
+			err := test.waitOneShot(ctx, servicesErrCh)
 			if errors.Is(err, context.Canceled) {
 				break Runs
 			}
@@ -225,37 +225,51 @@ Runs:
 			return
 		}
 
-		select {
-		case <-ctx.Done():
-			break Runs
-		case err := <-buildReadErr:
-			if test.done != nil {
-				test.cancel()
-				<-test.done
+		// A test finishing leaves the services running. Only an accepted build
+		// starts another iteration of the outer loop.
+		for {
+			select {
+			case <-ctx.Done():
+				test.stop()
+				break Runs
+			case serviceErr := <-servicesErrCh:
+				log.Print(serviceErr)
+			case testErr := <-test.done:
+				if testErr != nil {
+					log.Printf("Encountered error during test run: %v", testErr)
+				}
+				reportStartupTimes(testLabel, test, r.GetStartDurations())
+				test = testRun{}
+			case err := <-buildReadErr:
+				test.stop()
+				mustStopAllForExit()
+				panic(fmt.Errorf("reading iBazel notifications: %w", err))
+			case line := <-builds:
+				os.Stderr.WriteString(line)
+				if line != IBazelBuildSucceeded {
+					continue
+				}
+				serviceSpecs, err := readReloadSpecs(serviceSpecsPath, ports, svcctlPortStr)
+				if err != nil {
+					log.Printf("Skipping reload: %v", err)
+					continue
+				}
+				if test.done != nil {
+					if err := test.stop(); err != nil {
+						log.Printf("Test exited before reload: %v", err)
+					}
+					reportStartupTimes(testLabel, test, r.GetStartDurations())
+				}
+				if ctx.Err() != nil {
+					break Runs
+				}
+				discardServiceErrors(servicesErrCh)
+				start = time.Now()
+				criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(line))
+				must(err)
+				continue Runs
 			}
-			mustStopAllForExit()
-			panic(fmt.Errorf("reading iBazel notifications: %w", err))
-		case line := <-builds:
-			os.Stderr.WriteString(line)
-			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
-			must(err)
-			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
-			must(err)
-			if test.done != nil {
-				test.cancel()
-			}
-			discardServiceErrors(servicesErrCh)
-			criticalPath, err = r.UpdateSpecsAndRestart(serviceSpecs, servicesErrCh, []byte(line))
-			must(err)
-			continue
-		case testErr := <-test.done:
-			if testErr != nil {
-				log.Printf("Encountered error during test run: %s\n", testErr)
-			}
-		case serviceErr := <-servicesErrCh:
-			log.Print(serviceErr)
 		}
-		reportStartupTimes(testLabel, test, r.GetStartDurations())
 	}
 	log.Println("Shutting down services.")
 	mustStopAllForExit()
@@ -334,15 +348,26 @@ func startTest(ctx context.Context, ports svclib.Ports, start time.Time) testRun
 	return testRun{cmd: testCmd, cancel: cancel, done: done}
 }
 
-func waitOneShot(ctx context.Context, testDone, serviceErrors <-chan error) error {
+// stop waits for the child to exit before services are restarted or torn down.
+func (test testRun) stop() error {
+	if test.done == nil {
+		return nil
+	}
+	test.cancel()
+	return <-test.done
+}
+
+func (test testRun) waitOneShot(ctx context.Context, serviceErrors <-chan error) error {
 	select {
 	case <-ctx.Done():
+		test.stop()
 		return ctx.Err()
 	case err := <-serviceErrors:
+		test.stop()
 		return fmt.Errorf("service failed: %w", err)
-	case err := <-testDone:
+	case err := <-test.done:
 		if err != nil {
-			return err
+			return fmt.Errorf("test failed: %w", err)
 		}
 		// Both channels can be ready. A successful child must not hide a service failure.
 		select {
@@ -407,6 +432,22 @@ func warnNoServiceReload(testLabel string) {
 	fmt.Println()
 }
 
+func readReloadSpecs(
+	path string,
+	ports svclib.Ports,
+	svcctlPort string,
+) (runner.ServiceSpecs, error) {
+	specs, err := readServiceSpecs(path)
+	if err != nil {
+		return nil, fmt.Errorf("read service specs: %w", err)
+	}
+	versionedSpecs, err := augmentServiceSpecs(specs, ports, svcctlPort)
+	if err != nil {
+		return nil, fmt.Errorf("augment service specs: %w", err)
+	}
+	return versionedSpecs, nil
+}
+
 func discardServiceErrors(servicesErrCh <-chan error) {
 	// Discard errors already queued by services from the previous build.
 	// See https://github.com/hermeticbuild/rules_itest/issues/72.
@@ -426,7 +467,9 @@ func readServiceSpecs(
 	map[string]svclib.ServiceSpec, error,
 ) {
 	data, err := os.ReadFile(path)
-	must(err)
+	if err != nil {
+		return nil, err
+	}
 
 	var serviceSpecs map[string]svclib.ServiceSpec
 	err = json.Unmarshal(data, &serviceSpecs)

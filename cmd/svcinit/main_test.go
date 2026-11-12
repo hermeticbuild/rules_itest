@@ -1,8 +1,10 @@
 package main_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,63 @@ const child = "//:child"
 
 // Bound a missing report or a supervisor that fails to exit after a read error.
 const supervisorTimeout = 30 * time.Second
+
+func TestRerunAfterSuccessfulBuild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), supervisorTimeout)
+	cmd := ibazelCommand(t, ctx)
+	// svcinit stays up after the last report. Cancel it before waiting for exit.
+	defer cmd.Wait()
+	defer cancel()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Launch logs go to stderr, timing reports to stdout. Their order matters.
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The child (exit0) finishes on its own. Send no builds until svcinit reports it.
+	output := bufio.NewReader(stdout)
+	readThroughReport(t, output)
+
+	const builds = svcinit.IBazelBuildStarted + svcinit.IBazelBuildFailed +
+		svcinit.IBazelBuildStarted + svcinit.IBazelBuildSucceeded
+	if _, err := io.WriteString(stdin, builds); err != nil {
+		t.Fatal(err)
+	}
+
+	// Between the two reports there must be just one launch, after the success
+	// notification. Any earlier launch means svcinit reran without a good build.
+	logs := readThroughReport(t, output)
+	before, after, found := strings.Cut(logs, "\n"+svcinit.IBazelBuildSucceeded)
+	const launch = "Executing test:"
+	if !found || strings.Contains(before, launch) || strings.Count(after, launch) != 1 {
+		t.Fatalf("want one test launch after the successful build; got:\n%s", logs)
+	}
+}
+
+// Return everything svcinit writes through the child's row in the timing report.
+func readThroughReport(t *testing.T, output *bufio.Reader) string {
+	t.Helper()
+	var logs strings.Builder
+	for {
+		line, err := output.ReadString('\n')
+		logs.WriteString(line)
+		if err != nil {
+			t.Fatalf("reading %s report: %v\n%s", child, err, logs.String())
+		}
+		if strings.HasPrefix(line, child+" ") {
+			return logs.String()
+		}
+	}
+}
 
 func TestTruncatedIBazelNotification(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), supervisorTimeout)
