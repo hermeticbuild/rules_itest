@@ -341,7 +341,16 @@ func waitOneShot(ctx context.Context, testDone, serviceErrors <-chan error) erro
 	case err := <-serviceErrors:
 		return fmt.Errorf("service failed: %w", err)
 	case err := <-testDone:
-		return err
+		if err != nil {
+			return err
+		}
+		// Both channels can be ready. A successful child must not hide a service failure.
+		select {
+		case err := <-serviceErrors:
+			return fmt.Errorf("service failed: %w", err)
+		default:
+			return nil
+		}
 	}
 }
 
