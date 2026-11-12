@@ -292,7 +292,7 @@ func initializeServiceCmd(ctx context.Context, instance *ServiceInstance) error 
 	instance.startErrFn = sync.OnceValue(cmd.Start)
 	instance.waitErrFn = sync.OnceValue(func() error {
 		res := cmd.Wait()
-		instance.SetDone()
+		instance.setProcessState(cmd.ProcessState)
 		return res
 	})
 
@@ -306,6 +306,7 @@ func initializeServiceCmd(ctx context.Context, instance *ServiceInstance) error 
 
 	instance.mu.Lock()
 	instance.runErr = nil
+	instance.processState = nil
 	instance.done = false
 	instance.healthcheckAttempted = false
 	instance.mu.Unlock()
