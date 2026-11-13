@@ -30,6 +30,13 @@ import (
 	"rules_itest/svclib"
 )
 
+// iBazel's stdin notifications are complete lines, including the final newline.
+const (
+	IBazelBuildStarted   = "IBAZEL_BUILD_STARTED\n"
+	IBazelBuildFailed    = "IBAZEL_BUILD_COMPLETED FAILURE\n"
+	IBazelBuildSucceeded = "IBAZEL_BUILD_COMPLETED SUCCESS\n"
+)
+
 func must(err error) {
 	if err != nil {
 		panic(err)
@@ -65,15 +72,25 @@ func main() {
 	shouldHotReload := os.Getenv("IBAZEL_NOTIFY_CHANGES") == "y"
 	testLabel := os.Getenv("TEST_TARGET")
 
-	interactiveCh := make(chan string, 100)
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	defer cancelFunc()
+
+	builds := make(chan string)
+	buildReadErr := make(chan error, 1)
 	if shouldHotReload {
 		go func() {
 			scanner := bufio.NewScanner(os.Stdin)
+			scanner.Split(scanLinesKeepNewline)
 			for scanner.Scan() {
-				// TODO: better notification setup needed
-				interactiveCh <- scanner.Text()
-				//close(interactiveCh)
-				//interactiveCh = make(chan struct{})
+				select {
+				case builds <- scanner.Text():
+				case <-ctx.Done():
+					return
+				}
+			}
+			// Clean EOF ends notifications, not the service group.
+			if err := scanner.Err(); err != nil {
+				buildReadErr <- err
 			}
 		}()
 	}
@@ -135,9 +152,6 @@ func main() {
 
 	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
 	must(err)
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	defer cancelFunc()
 
 	r, err := runner.New(ctx, serviceSpecs)
 	must(err)
@@ -274,8 +288,15 @@ func main() {
 			mustStopAllForExit()
 			log.Println("Cleaning up.")
 			return
-		case ibazelCmd := <-interactiveCh:
-			log.Println(ibazelCmd)
+		case err := <-buildReadErr:
+			if testLabel != "" {
+				testCancel()
+				<-testErrCh
+			}
+			mustStopAllForExit()
+			panic(fmt.Errorf("reading iBazel notifications: %w", err))
+		case ibazelCmd := <-builds:
+			os.Stderr.WriteString(ibazelCmd)
 
 			// Restart any services as needed.
 			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
@@ -352,6 +373,17 @@ func main() {
 			break
 		}
 	}
+}
+
+// scanLinesKeepNewline returns each line with its delimiter and rejects a partial final line.
+func scanLinesKeepNewline(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i+1], nil
+	}
+	if atEOF && len(data) != 0 {
+		return 0, nil, io.ErrUnexpectedEOF
+	}
+	return 0, nil, nil
 }
 
 func readServiceSpecs(

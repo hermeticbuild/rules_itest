@@ -62,12 +62,24 @@ go_library(
 go_test(
     name = "svcinit_test",
     srcs = [
+        "main_test.go",
         "port_allocation_test.go",
         "port_names_test.go",
         "reserve_reusable_port_test.go",
     ],
+    data = [
+        ":svcinit",
+        "//:exit0",
+    ],
     embed = [":svcinit_lib"],
-    deps = ["//svclib"],
+    env = {
+        "SVCINIT_BINARY": "$(rlocationpath :svcinit)",
+        "SVCINIT_TEST_RLOCATION_PATH": "$(rlocationpath //:exit0)",
+    },
+    deps = [
+        "//svclib",
+        "@rules_go//go/runfiles",
+    ],
 )
 
 go_binary(
