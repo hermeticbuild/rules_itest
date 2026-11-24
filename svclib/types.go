@@ -1,6 +1,10 @@
 package svclib
 
-import "rules_itest/logger"
+import (
+	"io"
+
+	"rules_itest/logger"
+)
 
 // Created by Starlark
 type ServiceSpec struct {
@@ -36,6 +40,9 @@ type VersionedServiceSpec struct {
 	ServiceSpec
 	Version string
 	Color   string
+
+	// Shared across restarts. Close releases ordinary ports at launch and must be idempotent.
+	StartupPortReservation io.Closer `json:"-"`
 }
 
 func (v VersionedServiceSpec) Colorize(label string) string {

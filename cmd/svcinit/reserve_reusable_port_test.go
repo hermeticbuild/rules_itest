@@ -9,7 +9,7 @@ import (
 )
 
 func TestReusablePortReservation(t *testing.T) {
-	reservation, port, err := reserveReusablePort(0)
+	reservation, port, err := reservePort(0, true)
 	if err != nil {
 		t.Fatal(err)
 	}

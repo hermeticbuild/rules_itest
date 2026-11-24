@@ -133,7 +133,7 @@ func main() {
 		defer os.Remove("/tmp/svcctl_port")
 	}
 
-	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+	serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr, reservedPorts)
 	must(err)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -281,7 +281,7 @@ func main() {
 			unversionedSpecs, err := readServiceSpecs(serviceSpecsPath)
 			must(err)
 
-			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr)
+			serviceSpecs, err := augmentServiceSpecs(unversionedSpecs, ports, svcctlPortStr, reservedPorts)
 			must(err)
 
 			testCancel()
@@ -400,14 +400,12 @@ func assignPorts(
 	serviceSpecs map[string]svclib.ServiceSpec,
 	svcctlAddress string,
 ) (
-	_ svclib.Ports, _ map[string][]io.Closer, _ net.Listener, resultErr error,
+	_ svclib.Ports, _ map[string]*servicePorts, _ net.Listener, resultErr error,
 ) {
-	var toClose []io.Closer
-	reservedPorts := map[string][]io.Closer{}
+	reservedPorts := map[string]*servicePorts{}
 	var controlListener net.Listener
 	defer func() {
 		if resultErr != nil {
-			resultErr = errors.Join(resultErr, closePorts(toClose))
 			closeReservedPorts(reservedPorts)
 			if controlListener != nil {
 				resultErr = errors.Join(resultErr, controlListener.Close())
@@ -422,47 +420,20 @@ func assignPorts(
 		if _, exists := ports[name]; exists {
 			return nil, nil, nil, fmt.Errorf("duplicate port name %q", name)
 		}
-		port := request.port
-		var reservedPort io.Closer
+		// Ordinary port specifications also accept TCP service names and an empty port.
+		var requestedPort int
 		var err error
 		if request.reusable {
-			requestedPort, parseErr := strconv.Atoi(port)
-			if parseErr != nil || requestedPort < 0 || requestedPort > 65535 {
-				return nil, nil, nil, fmt.Errorf("invalid port %q for %s", port, request.label)
-			}
-			reservedPort, port, err = reserveReusablePort(requestedPort)
-			if err != nil {
-				return nil, nil, nil, err
-			}
+			requestedPort, err = strconv.Atoi(request.port)
 		} else {
-			// We do a bit of a dance here to set SO_LINGER to 0. For details, see
-			// https://stackoverflow.com/questions/71975992/what-really-is-the-linger-time-that-can-be-set-with-so-linger-on-sockets
-			lc := net.ListenConfig{
-				Control: func(network, address string, conn syscall.RawConn) error {
-					var setSockoptErr error
-					err := conn.Control(func(fd uintptr) {
-						setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
-							Onoff:  1,
-							Linger: 0,
-						})
-					})
-					if err != nil {
-						return err
-					}
-					return setSockoptErr
-				},
-			}
-
-			listener, listenErr := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
-			if listenErr != nil {
-				return nil, nil, nil, listenErr
-			}
-			_, port, err = net.SplitHostPort(listener.Addr().String())
-			if err != nil {
-				listener.Close()
-				return nil, nil, nil, err
-			}
-			reservedPort = listener
+			requestedPort, err = net.LookupPort("tcp", request.port)
+		}
+		if err != nil || requestedPort < 0 || requestedPort > 65535 {
+			return nil, nil, nil, fmt.Errorf("invalid port %q for %s", request.port, request.label)
+		}
+		socket, port, err := reservePort(requestedPort, request.reusable)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("reserve port for %s: %w", name, err)
 		}
 
 		if !terseOutput {
@@ -471,11 +442,12 @@ func assignPorts(
 
 		ports[name] = port
 
-		if request.reusable {
-			reservedPorts[request.label] = append(reservedPorts[request.label], reservedPort)
-		} else {
-			toClose = append(toClose, reservedPort)
+		held := reservedPorts[request.label]
+		if held == nil {
+			held = &servicePorts{reusable: request.reusable}
+			reservedPorts[request.label] = held
 		}
+		held.sockets = append(held.sockets, socket)
 	}
 
 	if err := assignPortAliases(ports, serviceSpecs); err != nil {
@@ -487,18 +459,6 @@ func assignPorts(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("listen for svcctl: %w", err)
 	}
-	// Ordinary services need their ports released before they can bind, which
-	// leaves a race with other processes. Reusable reservations remain held.
-	err = closePorts(toClose)
-	toClose = nil
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	// Complete hack - we have observed that the ports may not be ready immediately after closing, even with SO_LINGER set to 0.
-	// Give the kernel a bit of time to figure out what we've done.
-	time.Sleep(10 * time.Millisecond)
-
 	serializedPorts, err := ports.Marshal()
 	if err != nil {
 		return nil, nil, nil, err
@@ -507,20 +467,27 @@ func assignPorts(
 	return ports, reservedPorts, controlListener, nil
 }
 
-func closePorts(ports []io.Closer) error {
-	var err error
-	for _, port := range ports {
-		err = errors.Join(err, port.Close())
-	}
-	return err
+// Each service's reservations have a single owner across launch, reload and teardown.
+type servicePorts struct {
+	sockets  []io.Closer
+	reusable bool
+	once     sync.Once
+	err      error
 }
 
-func closeReservedPorts(reservedPorts map[string][]io.Closer) {
-	for label, ports := range reservedPorts {
-		for _, port := range ports {
-			if err := port.Close(); err != nil {
-				log.Printf("failed to close reusable port reservation for %s: %v\n", label, err)
-			}
+func (p *servicePorts) Close() error {
+	p.once.Do(func() {
+		for _, socket := range p.sockets {
+			p.err = errors.Join(p.err, socket.Close())
+		}
+	})
+	return p.err
+}
+
+func closeReservedPorts(reservedPorts map[string]*servicePorts) {
+	for label, held := range reservedPorts {
+		if err := held.Close(); err != nil {
+			log.Printf("failed to close port reservation for %s: %v", label, err)
 		}
 	}
 }
@@ -529,6 +496,7 @@ func augmentServiceSpecs(
 	serviceSpecs map[string]svclib.ServiceSpec,
 	ports svclib.Ports,
 	svcctlPort string,
+	reservedPorts map[string]*servicePorts,
 ) (
 	map[string]svclib.VersionedServiceSpec, error,
 ) {
@@ -539,6 +507,10 @@ func augmentServiceSpecs(
 	for label, serviceSpec := range serviceSpecs {
 		s := svclib.VersionedServiceSpec{
 			ServiceSpec: serviceSpec,
+		}
+
+		if held := reservedPorts[label]; held != nil && !held.reusable {
+			s.StartupPortReservation = held
 		}
 
 		if s.Type == "group" {

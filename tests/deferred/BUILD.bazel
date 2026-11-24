@@ -1,5 +1,5 @@
 load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
-load("@rules_itest//:itest.bzl", "itest_service", "itest_task", "service_test")
+load("@rules_itest//:itest.bzl", "itest_service", "itest_task", "named_port", "port", "service_test")
 load(":tests.bzl", "tests")
 
 tests()
@@ -44,14 +44,32 @@ itest_service(
     tags = ["requires-network"],
 )
 
+go_binary(
+    name = "probe_ports",
+    srcs = ["probe_ports/main.go"],
+)
+
+itest_task(
+    name = "probe_reserved_ports",
+    args = [
+        port(":non_deferred_itest_service"),
+        named_port(":non_deferred_itest_service", "extra"),
+    ],
+    exe = ":probe_ports",
+    # These ports only exist when the owning service is in the suite.
+    hygienic = False,
+)
+
 itest_service(
     name = "non_deferred_itest_service",
     args = [
         "$${PORT}",
     ],
     autoassign_port = True,
+    deps = [":probe_reserved_ports"],
     exe = ":deferred",
     http_health_check_address = "http://localhost:$${PORT}/healthz",
+    named_ports = ["extra"],
     tags = ["requires-network"],
 )
 
