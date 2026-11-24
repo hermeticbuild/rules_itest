@@ -19,7 +19,12 @@ query:enable-reload --@rules_itest//:enable_per_service_reload
 In addition, if the `hot_reloadable` attribute is set on an `itest_service`, the service manager will
 forward the ibazel hot-reload notification over stdin instead of restarting the service.
 
-# Reusable port reservations
+# Port reservations
+
+The service manager reserves each service's assigned TCP ports without listening while its dependencies
+start. It releases ordinary ports immediately before launching their owning process, including a
+deferred service's first start. Another process can still bind a port between launch and the service's
+own bind.
 
 For each service with `so_reuseport_aware = True`, the service manager adds
 `RULES_ITEST_ENABLE_SO_REUSEPORT=1` to that service's environment. Services can use this signal to

@@ -289,7 +289,14 @@ func initializeServiceCmd(ctx context.Context, instance *ServiceInstance) error 
 
 	instance.cmd = cmd
 	instance.killed = false
-	instance.startErrFn = sync.OnceValue(cmd.Start)
+	instance.startErrFn = sync.OnceValue(func() error {
+		if s.StartupPortReservation != nil {
+			if err := s.StartupPortReservation.Close(); err != nil {
+				return fmt.Errorf("release ports for %s: %w", s.Label, err)
+			}
+		}
+		return cmd.Start()
+	})
 	instance.waitErrFn = sync.OnceValue(func() error {
 		res := cmd.Wait()
 		instance.SetDone()

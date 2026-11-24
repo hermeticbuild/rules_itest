@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,12 +37,21 @@ func TestStartDeferredService(t *testing.T) {
 		t.Errorf("SVCCTL_PORT not set")
 	}
 
-	client := svcctl.NewSvcctlClient("http://localhost:" + port, http.DefaultClient)
+	client := svcctl.NewSvcctlClient("http://localhost:"+port, http.DefaultClient)
+
+	servicePort, err := getPort("@@//deferred:deferred_itest_service")
+	if err != nil {
+		t.Fatalf("get deferred service port: %v", err)
+	}
+	if listener, err := net.Listen("tcp4", "127.0.0.1:"+*servicePort); err == nil {
+		listener.Close()
+		t.Fatal("claimed deferred service port before its first start")
+	}
 
 	log.Println("Starting deferred service...")
-	err := client.StartService(context.Background(), "@@//deferred:deferred_itest_service", true)
+	err = client.StartService(context.Background(), "@@//deferred:deferred_itest_service", true)
 	if err != nil {
-		t.Errorf("Failed to start deferred service: %v", err)
+		t.Fatalf("Failed to start deferred service: %v", err)
 	}
 
 	for {
@@ -56,12 +66,6 @@ func TestStartDeferredService(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	log.Println("Getting port for deferred service...")
-	servicePort, err := getPort("@@//deferred:deferred_itest_service")
-	if err != nil {
-		t.Errorf("Failed to get port for deferred service: %v", err)
-	}
-
 	v := &payload{
 		Value: "test",
 	}
@@ -69,7 +73,7 @@ func TestStartDeferredService(t *testing.T) {
 	data, _ := json.Marshal(v)
 
 	log.Printf("Deferred service is running on port %s", *servicePort)
-	_, err = http.Post("http://localhost:" + *servicePort + "/update", "text/plain", bytes.NewReader(data))
+	_, err = http.Post("http://localhost:"+*servicePort+"/update", "text/plain", bytes.NewReader(data))
 	if err != nil {
 		t.Errorf("Failed to call update endpoint: %v", err)
 		return
@@ -94,4 +98,17 @@ func TestStartDeferredService(t *testing.T) {
 		t.Errorf("Got response %q, want %q", string(data), "test")
 	}
 
+}
+
+// The service binds its default port; its unused named port is also released at launch.
+func TestNamedPortReleasedAtLaunch(t *testing.T) {
+	port, err := getPort("@@//deferred:non_deferred_itest_service.extra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:"+*port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.Close()
 }
